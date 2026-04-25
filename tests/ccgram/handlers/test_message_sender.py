@@ -2,7 +2,7 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 from telegram import Message
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import BadRequest, RetryAfter, TelegramError
 
 from ccgram.handlers.message_sender import (
     MESSAGE_SEND_INTERVAL,
@@ -178,6 +178,13 @@ class TestEditWithFallback:
         assert bot.edit_message_text.call_count == 2
         fallback_kwargs = bot.edit_message_text.call_args_list[1].kwargs
         assert "entities" not in fallback_kwargs
+
+    async def test_not_modified_is_success_without_plain_fallback(self) -> None:
+        bot = AsyncMock()
+        bot.edit_message_text.side_effect = BadRequest("Message is not modified")
+        result = await edit_with_fallback(bot, 123, 1, "```Tools\nx\n```")
+        assert result is True
+        assert bot.edit_message_text.call_count == 1
 
     async def test_both_fail_returns_false(self) -> None:
         bot = AsyncMock()

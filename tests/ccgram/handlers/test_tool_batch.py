@@ -30,7 +30,7 @@ class TestFormatBatchMessage:
 
         result = format_batch_message(entries)
 
-        assert result.startswith("```Tools\n")
+        assert result.startswith("```\nTools\n")
         assert '📖 Read: "src/foo.py" ↻' in result
         assert '⚡ Bash: "make test" ✓' in result
         assert '⚡ Bash: "bad" ❌' in result
@@ -76,7 +76,7 @@ class TestFormatBatchMessage:
             provider_label="Codex",
         )
 
-        assert result.startswith("```Codex Tools\n")
+        assert result.startswith("```\nCodex Tools\n")
 
     def test_below_limit_renders_all_tools(self) -> None:
         entries = [

@@ -33,7 +33,7 @@ logger = structlog.get_logger()
 
 TELEGRAM_TEXT_LIMIT = 4096
 TOOL_BUBBLE_TITLE = "Tools"
-TOOL_SUMMARY_LIMIT = 160
+TOOL_SUMMARY_LIMIT = 88
 _TOOL_LINE_ELLIPSIS = "…"
 
 ToolStatus = Literal["pending", "success", "error"]
@@ -205,14 +205,12 @@ def _render_tool_bubble(
     title: str,
     hidden_count: int,
 ) -> str:
-    body_lines: list[str] = []
+    body_lines: list[str] = [title]
     if hidden_count > 0:
         body_lines.append(f"{_TOOL_LINE_ELLIPSIS} {hidden_count} earlier tools {_TOOL_LINE_ELLIPSIS}")
     body_lines.extend(visible_lines)
     body = "\n".join(body_lines)
-    if body:
-        return f"```{title}\n{body}\n```"
-    return f"```{title}\n```"
+    return f"```\n{body}\n```"
 
 
 def _truncate_line_to_fit(line: str, title: str, hidden_count: int) -> str:
@@ -469,8 +467,6 @@ async def _send_fresh_batch_message(
 
 
 async def _handle_tool_result(
-    bot: Bot,
-    user_id: int,
     task: ContentTask,
     batch: ToolBatch | None,
     thread_id_or_0: int,
@@ -480,7 +476,7 @@ async def _handle_tool_result(
     Returns (updated_batch, followup) — followup is non-None when the result
     could not be absorbed into the batch and should be delivered as content.
     """
-    if not task.tool_use_id or not batch:
+    if not batch:
         logger.debug(
             "tool result falls through window=%s thread=%s tool_id=%s has_batch=%s",
             task.window_id,
@@ -489,6 +485,14 @@ async def _handle_tool_result(
             bool(batch),
         )
         return None, task
+    if not task.tool_use_id:
+        logger.debug(
+            "tool result without id suppressed window=%s thread=%s entries=%d",
+            task.window_id,
+            thread_id_or_0,
+            len(batch.entries),
+        )
+        return batch, None
     for entry in batch.entries:
         if entry.tool_use_id == task.tool_use_id:
             text = "\n".join(task.parts) if task.parts else ""
@@ -504,14 +508,13 @@ async def _handle_tool_result(
             )
             return batch, None
     logger.debug(
-        "tool result unmatched window=%s thread=%s tool_id=%s entries=%d",
+        "tool result unmatched suppressed window=%s thread=%s tool_id=%s entries=%d",
         task.window_id,
         thread_id_or_0,
         task.tool_use_id,
         len(batch.entries),
     )
-    await flush_batch(bot, user_id, thread_id_or_0)
-    return None, task
+    return batch, None
 
 
 def _add_tool_use_entry(
@@ -556,7 +559,7 @@ async def process_tool_event(
 
     if task.content_type == "tool_result":
         batch, followup = await _handle_tool_result(
-            bot, user_id, task, batch, thread_id_or_0
+            task, batch, thread_id_or_0
         )
         if batch is None:
             return followup

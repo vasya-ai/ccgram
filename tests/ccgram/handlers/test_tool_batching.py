@@ -100,7 +100,7 @@ class TestFormatBatchMessage:
             ]
         )
 
-        assert result.startswith("```Tools\n")
+        assert result.startswith("```\nTools\n")
         assert '📖 Read: "src/a.py" ✓' in result
         assert '✏️ Edit: "src/a.py" ↻' in result
         assert '⚡ Bash: "make test" ↻' in result
@@ -357,7 +357,7 @@ class TestProcessBatchTask:
         assert 'Bash: "first" ↻' in edited_text
         assert 'Bash: "second" ↻' in edited_text
 
-    async def test_tool_result_no_matching_entry_flushes_and_falls_through(
+    async def test_tool_result_no_matching_entry_is_suppressed_without_flushing(
         self, batch_env
     ) -> None:
         bot, _, _ = batch_env
@@ -368,8 +368,9 @@ class TestProcessBatchTask:
             task = _make_tool_result(tool_use_id="tu_unknown")
             followup = await process_tool_event(bot, 1, task)
 
-        mock_flush.assert_awaited_once()
-        assert followup == task
+        mock_flush.assert_not_awaited()
+        assert followup is None
+        assert (1, 10) in _active_batches
 
     async def test_tool_result_no_active_batch_falls_through(self, batch_env) -> None:
         bot, _, _ = batch_env
@@ -377,12 +378,12 @@ class TestProcessBatchTask:
         result = await process_tool_event(bot, 1, task)
         assert result == task
 
-    async def test_tool_result_none_tool_use_id_falls_through(self, batch_env) -> None:
+    async def test_tool_result_none_tool_use_id_is_suppressed_with_active_batch(self, batch_env) -> None:
         bot, _, _ = batch_env
         await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
         task = _make_tool_result(tool_use_id=None, text="result text")
         result = await process_tool_event(bot, 1, task)
-        assert result == task
+        assert result is None
         assert len(_active_batches[(1, 10)].entries) == 1
 
     async def test_different_window_flushes_old_batch(self, batch_env) -> None:

@@ -35,6 +35,14 @@ def is_thread_gone(exc: TelegramError) -> bool:
     return False
 
 
+def is_message_not_modified(exc: TelegramError) -> bool:
+    """Check if Telegram rejected an edit because the message is unchanged."""
+    if isinstance(exc, BadRequest):
+        msg = exc.message.lower()
+        return "message is not modified" in msg or "not modified" in msg
+    return False
+
+
 # Disable link previews in all messages to reduce visual noise
 NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -148,6 +156,9 @@ async def _with_entity_fallback(
                 last_error = e2
         except TelegramError as e:
             if is_thread_gone(e):
+                return None
+            if context_label.startswith("edit") and is_message_not_modified(e):
+                logger.debug("telegram %s not modified", context_label)
                 return None
             last_error = e
 
@@ -283,7 +294,14 @@ async def edit_with_fallback(
         return True
     except RetryAfter:
         raise
-    except TelegramError:
+    except TelegramError as exc:
+        if is_message_not_modified(exc):
+            logger.debug(
+                "telegram edit not modified chat=%s message_id=%s",
+                chat_id,
+                message_id,
+            )
+            return True
         try:
             fallback = plain_text
             await bot.edit_message_text(
@@ -300,7 +318,14 @@ async def edit_with_fallback(
             return True
         except RetryAfter:
             raise
-        except TelegramError:
+        except TelegramError as fallback_exc:
+            if is_message_not_modified(fallback_exc):
+                logger.debug(
+                    "telegram edit not modified chat=%s message_id=%s phase=plain",
+                    chat_id,
+                    message_id,
+                )
+                return True
             logger.debug(
                 "telegram edit failed chat=%s message_id=%s",
                 chat_id,
