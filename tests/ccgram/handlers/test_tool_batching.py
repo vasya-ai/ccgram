@@ -2,8 +2,12 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telegram import MessageEntity
 from telegram.error import RetryAfter
 
+from ccgram.entity_formatting import convert_to_entities
+from ccgram.expandable_quote import EXPANDABLE_QUOTE_END as EXP_END
+from ccgram.expandable_quote import EXPANDABLE_QUOTE_START as EXP_START
 from ccgram.handlers.message_queue import (
     _handle_content_task,
     get_or_create_queue,
@@ -15,6 +19,7 @@ from ccgram.handlers.tool_batch import (
     ToolBatch,
     ToolBatchEntry,
     _active_batches,
+    clear_all_batches,
     clear_batch_for_topic,
     flush_batch,
     format_batch_message,
@@ -52,10 +57,16 @@ def batch_env():
 
 
 @pytest.fixture(autouse=True)
-def _clear_batches():
+def _clear_batches(tmp_path, monkeypatch):
+    from ccgram.handlers import tool_batch
+
+    state_path = tmp_path / "tool_batches.json"
+    monkeypatch.setattr(tool_batch, "_tool_batch_state_path", lambda: state_path)
+    tool_batch._persistent_batches_loaded = False
     _active_batches.clear()
     yield
     _active_batches.clear()
+    tool_batch._persistent_batches_loaded = False
 
 
 def _make_tool_use(
@@ -100,7 +111,11 @@ class TestFormatBatchMessage:
             ]
         )
 
-        assert result.startswith("```\nTools\n")
+        assert result.startswith(f"{EXP_START}Tools\n")
+        assert result.endswith(EXP_END)
+        plain, entities = convert_to_entities(result)
+        assert plain.startswith("Tools\n")
+        assert any(e.type == MessageEntity.EXPANDABLE_BLOCKQUOTE for e in entities)
         assert '📖 Read: "src/a.py" ✓' in result
         assert '✏️ Edit: "src/a.py" ↻' in result
         assert '⚡ Bash: "make test" ↻' in result
@@ -438,6 +453,73 @@ class TestProcessBatchTask:
         assert batch.telegram_msg_id == 101
         assert mock_send.await_count == 2
         assert mock_send.await_args.kwargs["disable_notification"] is True
+
+    async def test_persisted_batch_after_restart_edits_existing_message(
+        self, batch_env
+    ) -> None:
+        from ccgram.handlers import tool_batch
+
+        bot, mock_send, _ = batch_env
+        await process_tool_event(
+            bot,
+            1,
+            _make_tool_use(tool_use_id="tu1", text="Bash first", tool_name="Bash"),
+        )
+
+        _active_batches.clear()
+        tool_batch._persistent_batches_loaded = False
+        await process_tool_event(
+            bot,
+            1,
+            _make_tool_use(tool_use_id="tu2", text="Bash second", tool_name="Bash"),
+        )
+
+        batch = _active_batches[(1, 10)]
+        assert batch.telegram_msg_id == 100
+        assert [entry.tool_use_id for entry in batch.entries] == ["tu1", "tu2"]
+        mock_send.assert_awaited_once()
+        assert bot.edit_message_text.await_args.kwargs["message_id"] == 100
+        edited_text = bot.edit_message_text.await_args.kwargs["text"]
+        assert 'Bash: "first" ↻' in edited_text
+        assert 'Bash: "second" ↻' in edited_text
+
+    async def test_flush_removes_persisted_batch(self, batch_env) -> None:
+        from ccgram.handlers import tool_batch
+
+        bot, _, _ = batch_env
+        await process_tool_event(bot, 1, _make_tool_use())
+        state_path = tool_batch._tool_batch_state_path()
+        assert state_path.exists()
+
+        await flush_batch(bot, 1, 10)
+
+        assert not state_path.exists()
+
+    async def test_shutdown_clear_keeps_persisted_batch_for_restart(
+        self, batch_env
+    ) -> None:
+        from ccgram.handlers import tool_batch
+
+        bot, mock_send, _ = batch_env
+        await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
+        state_path = tool_batch._tool_batch_state_path()
+
+        clear_all_batches()
+        assert (1, 10) not in _active_batches
+        assert state_path.exists()
+
+        tool_batch._persistent_batches_loaded = False
+        await process_tool_event(
+            bot,
+            1,
+            _make_tool_use(tool_use_id="tu2", text="Read src/bar.py"),
+        )
+
+        assert [entry.tool_use_id for entry in _active_batches[(1, 10)].entries] == [
+            "tu1",
+            "tu2",
+        ]
+        mock_send.assert_awaited_once()
 
 
 class TestHandleContentTask:

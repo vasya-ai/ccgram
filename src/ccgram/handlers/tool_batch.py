@@ -3,26 +3,32 @@
 Accumulates consecutive tool_use / tool_result messages into one compact
 Telegram message that is edited in place as tools arrive and complete.  The
 full in-memory entry list is retained for the active turn; rendering rotates to
-the newest entries that fit Telegram's text limit.
+the newest entries that fit Telegram's text limit. Active batches are persisted
+so a service restart can continue editing the same Telegram message.
 
 Key components:
   - ToolBatchEntry / ToolBatch: batch state dataclasses
   - process_tool_event: state-machine entry point (add tool_use or tool_result)
   - flush_batch: finalize and send the last edit for a batch
   - is_batch_eligible: predicate combining task eligibility and window mode
-  - format_batch_message: render entries as a compact fenced tool bubble
+  - format_batch_message: render entries as a compact expandable quote
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 
 import structlog
 from telegram import Bot
 
+from ..expandable_quote import EXPANDABLE_QUOTE_END, EXPANDABLE_QUOTE_START
+from ..utils import atomic_write_json, ccgram_dir
 from ..window_query import get_batch_mode
 from ..thread_router import thread_router
 from ..topic_state_registry import topic_state
@@ -35,6 +41,9 @@ TELEGRAM_TEXT_LIMIT = 4096
 TOOL_BUBBLE_TITLE = "Tools"
 TOOL_SUMMARY_LIMIT = 88
 _TOOL_LINE_ELLIPSIS = "…"
+_TOOL_BUBBLE_RENDERED_LIMIT = 3800
+_PERSISTED_BATCH_STATE_VERSION = 1
+_PERSISTED_BATCH_MAX_AGE_SECONDS = 6 * 60 * 60
 
 ToolStatus = Literal["pending", "success", "error"]
 
@@ -80,6 +89,7 @@ class ToolBatch:
 
 # Active tool batches: (user_id, thread_id_or_0) -> ToolBatch
 _active_batches: dict[tuple[int, int], ToolBatch] = {}
+_persistent_batches_loaded = False
 
 _MARKDOWN_TOOL_PREFIX_RE = re.compile(r"\*\*([^*]+)\*\*\s*(.*)$")
 _PLAIN_TOOL_PREFIX_RE = re.compile(r"^\W*([A-Za-z_][\w.:-]*)\b\s*(.*)$")
@@ -154,7 +164,7 @@ def format_batch_message(
     subagent_label: str | None = None,
     provider_label: str | None = None,
 ) -> str:
-    """Render the active tool list as a compact fenced Telegram bubble."""
+    """Render the active tool list as a compact expandable Telegram quote."""
     del subagent_label  # Legacy signature; task grouping text is intentionally gone.
     title = _tool_bubble_title(provider_label)
     lines = [_format_batch_entry(entry) for entry in entries]
@@ -187,7 +197,7 @@ def _rotate_tool_lines(lines: list[str], title: str) -> str:
     for index in range(len(lines) - 1, -1, -1):
         candidate = [lines[index], *visible]
         hidden_count = index
-        if len(_render_tool_bubble(candidate, title, hidden_count)) <= TELEGRAM_TEXT_LIMIT:
+        if _tool_bubble_fits(candidate, title, hidden_count):
             visible = candidate
             continue
         break
@@ -205,17 +215,42 @@ def _render_tool_bubble(
     title: str,
     hidden_count: int,
 ) -> str:
+    body = _render_tool_bubble_body(visible_lines, title, hidden_count)
+    return f"{EXPANDABLE_QUOTE_START}{body}{EXPANDABLE_QUOTE_END}"
+
+
+def _render_tool_bubble_body(
+    visible_lines: list[str],
+    title: str,
+    hidden_count: int,
+) -> str:
     body_lines: list[str] = [title]
     if hidden_count > 0:
         body_lines.append(f"{_TOOL_LINE_ELLIPSIS} {hidden_count} earlier tools {_TOOL_LINE_ELLIPSIS}")
     body_lines.extend(visible_lines)
-    body = "\n".join(body_lines)
-    return f"```\n{body}\n```"
+    return "\n".join(body_lines)
+
+
+def _tool_bubble_fits(
+    visible_lines: list[str],
+    title: str,
+    hidden_count: int,
+) -> bool:
+    body = _render_tool_bubble_body(visible_lines, title, hidden_count)
+    rendered = f"{EXPANDABLE_QUOTE_START}{body}{EXPANDABLE_QUOTE_END}"
+    return (
+        len(body) <= _TOOL_BUBBLE_RENDERED_LIMIT
+        and len(rendered) <= TELEGRAM_TEXT_LIMIT
+    )
 
 
 def _truncate_line_to_fit(line: str, title: str, hidden_count: int) -> str:
-    line_overhead = len(_render_tool_bubble(["x"], title, hidden_count)) - 1
-    available = TELEGRAM_TEXT_LIMIT - line_overhead
+    body_overhead = len(_render_tool_bubble_body(["x"], title, hidden_count)) - 1
+    rendered_overhead = len(_render_tool_bubble(["x"], title, hidden_count)) - 1
+    available = min(
+        _TOOL_BUBBLE_RENDERED_LIMIT - body_overhead,
+        TELEGRAM_TEXT_LIMIT - rendered_overhead,
+    )
     if available <= 0:
         return ""
     if len(line) <= available:
@@ -385,6 +420,179 @@ def _extract_task_tool_suffix(entry: ToolBatchEntry) -> str:
 # ---------------------------------------------------------------------------
 # State machine — process_tool_event / flush_batch
 # ---------------------------------------------------------------------------
+
+
+def _tool_batch_state_path() -> Path:
+    return ccgram_dir() / "tool_batches.json"
+
+
+def _entry_to_data(entry: ToolBatchEntry) -> dict[str, Any]:
+    return {
+        "tool_use_id": entry.tool_use_id,
+        "tool_use_text": entry.tool_use_text,
+        "tool_result_text": entry.tool_result_text,
+        "tool_name": entry.tool_name,
+        "summary": entry.summary,
+        "status": entry.status,
+        "result_text": entry.result_text,
+    }
+
+
+def _entry_from_data(data: dict[str, Any]) -> ToolBatchEntry | None:
+    try:
+        status = data.get("status", "pending")
+        if status not in ("pending", "success", "error"):
+            status = "pending"
+        return ToolBatchEntry(
+            tool_use_id=data.get("tool_use_id"),
+            tool_use_text=str(data.get("tool_use_text") or ""),
+            tool_result_text=data.get("tool_result_text"),
+            tool_name=data.get("tool_name"),
+            summary=str(data.get("summary") or ""),
+            status=status,
+            result_text=data.get("result_text"),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _batch_to_data(batch: ToolBatch) -> dict[str, Any]:
+    return {
+        "window_id": batch.window_id,
+        "thread_id": batch.thread_id,
+        "telegram_msg_id": batch.telegram_msg_id,
+        "total_length": batch.total_length,
+        "entries": [_entry_to_data(entry) for entry in batch.entries],
+    }
+
+
+def _batch_from_data(data: dict[str, Any]) -> ToolBatch | None:
+    try:
+        entries_data = data.get("entries") or []
+        entries = [
+            entry
+            for entry_data in entries_data
+            if isinstance(entry_data, dict)
+            for entry in [_entry_from_data(entry_data)]
+            if entry is not None
+        ]
+        if not entries:
+            return None
+        return ToolBatch(
+            window_id=str(data["window_id"]),
+            thread_id=int(data["thread_id"]),
+            entries=entries,
+            telegram_msg_id=(
+                int(data["telegram_msg_id"])
+                if data.get("telegram_msg_id") is not None
+                else None
+            ),
+            total_length=int(data.get("total_length") or 0),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _read_persisted_batch_data() -> dict[str, Any] | None:
+    path = _tool_batch_state_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("failed to load persisted tool batches: %s", exc)
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    if data.get("version") != _PERSISTED_BATCH_STATE_VERSION:
+        return None
+    return data
+
+
+def _restore_persisted_batch_item(
+    item: Any,
+    now: float,
+) -> tuple[tuple[int, int], ToolBatch] | None | Literal["stale"]:
+    if not isinstance(item, dict):
+        return None
+    try:
+        user_id = int(item["user_id"])
+        thread_id = int(item["thread_id"])
+        updated_at = float(item.get("updated_at") or 0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if now - updated_at > _PERSISTED_BATCH_MAX_AGE_SECONDS:
+        return "stale"
+
+    batch_data = item.get("batch")
+    if not isinstance(batch_data, dict):
+        return None
+    batch = _batch_from_data(batch_data)
+    if batch is None:
+        return None
+    return (user_id, thread_id), batch
+
+
+def _load_active_batches_if_needed() -> None:
+    global _persistent_batches_loaded
+    if _persistent_batches_loaded:
+        return
+    _persistent_batches_loaded = True
+
+    data = _read_persisted_batch_data()
+    if data is None:
+        return
+
+    now = time.time()
+    loaded_count = 0
+    stale_count = 0
+    for item in data.get("batches", []):
+        restored = _restore_persisted_batch_item(item, now)
+        if restored == "stale":
+            stale_count += 1
+            continue
+        if restored is None:
+            continue
+        key, batch = restored
+        _active_batches.setdefault(key, batch)
+        loaded_count += 1
+
+    if stale_count > 0:
+        _persist_active_batches()
+    if loaded_count:
+        logger.debug("loaded persisted tool batches count=%d", loaded_count)
+
+
+def _persist_active_batches() -> None:
+    path = _tool_batch_state_path()
+    active_items = [
+        {
+            "user_id": user_id,
+            "thread_id": thread_id,
+            "updated_at": time.time(),
+            "batch": _batch_to_data(batch),
+        }
+        for (user_id, thread_id), batch in sorted(_active_batches.items())
+        if batch.entries
+    ]
+    if not active_items:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("failed to remove persisted tool batches: %s", exc)
+        return
+
+    try:
+        atomic_write_json(
+            path,
+            {"version": _PERSISTED_BATCH_STATE_VERSION, "batches": active_items},
+        )
+    except OSError as exc:
+        logger.warning("failed to persist tool batches: %s", exc)
 
 
 async def _send_or_edit_batch(
@@ -571,6 +779,7 @@ async def process_tool_event(
     thread_id_or_0 = thread_key(task.thread_id)
     bkey = (user_id, thread_id_or_0)
     chat_id = thread_router.resolve_chat_id(user_id, task.thread_id)
+    _load_active_batches_if_needed()
     batch = _active_batches.get(bkey)
 
     if task.content_type == "tool_result":
@@ -594,6 +803,7 @@ async def process_tool_event(
     await _send_or_edit_batch(
         bot, user_id, batch, chat_id, task.thread_id, thread_id_or_0
     )
+    _persist_active_batches()
     return None
 
 
@@ -655,9 +865,11 @@ async def flush_if_active(bot: Bot, user_id: int, task: ContentTask) -> None:
 
 async def flush_batch(bot: Bot, user_id: int, thread_id_or_0: int) -> None:
     """Finalize the active batch: do a final edit and clear state."""
+    _load_active_batches_if_needed()
     bkey = (user_id, thread_id_or_0)
     batch = _active_batches.pop(bkey, None)
     if not batch or not batch.entries:
+        _persist_active_batches()
         return
 
     thread_id: int | None = thread_id_or_0 if thread_id_or_0 != 0 else None
@@ -681,6 +893,7 @@ async def flush_batch(bot: Bot, user_id: int, thread_id_or_0: int) -> None:
             thread_id,
             batch_text,
         )
+        _persist_active_batches()
         return
 
     success = await edit_with_fallback(
@@ -697,19 +910,23 @@ async def flush_batch(bot: Bot, user_id: int, thread_id_or_0: int) -> None:
             thread_id,
             batch_text,
         )
+    _persist_active_batches()
 
 
 def has_active_batch(user_id: int, thread_id_or_0: int) -> bool:
     """Check if there is an active batch for a (user, thread) pair."""
+    _load_active_batches_if_needed()
     return (user_id, thread_id_or_0) in _active_batches
 
 
 @topic_state.register("topic")
 def clear_batch_for_topic(user_id: int, thread_id: int | None = None) -> None:
     """Clear active batch for a specific topic (called on topic cleanup)."""
+    _load_active_batches_if_needed()
     _active_batches.pop((user_id, thread_key(thread_id)), None)
+    _persist_active_batches()
 
 
 def clear_all_batches() -> None:
-    """Clear all active batches (called on shutdown)."""
+    """Clear process-local batches without deleting restart recovery state."""
     _active_batches.clear()

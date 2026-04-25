@@ -3,7 +3,11 @@ import inspect
 import os
 
 import pytest
+from telegram import MessageEntity
 
+from ccgram.entity_formatting import convert_to_entities
+from ccgram.expandable_quote import EXPANDABLE_QUOTE_END as EXP_END
+from ccgram.expandable_quote import EXPANDABLE_QUOTE_START as EXP_START
 from ccgram.handlers.message_task import ContentTask
 from ccgram.handlers.tool_batch import (
     TELEGRAM_TEXT_LIMIT,
@@ -30,7 +34,11 @@ class TestFormatBatchMessage:
 
         result = format_batch_message(entries)
 
-        assert result.startswith("```\nTools\n")
+        assert result.startswith(f"{EXP_START}Tools\n")
+        assert result.endswith(EXP_END)
+        plain, entities = convert_to_entities(result)
+        assert plain.startswith("Tools\n")
+        assert any(e.type == MessageEntity.EXPANDABLE_BLOCKQUOTE for e in entities)
         assert '📖 Read: "src/foo.py" ↻' in result
         assert '⚡ Bash: "make test" ✓' in result
         assert '⚡ Bash: "bad" ❌' in result
@@ -76,7 +84,7 @@ class TestFormatBatchMessage:
             provider_label="Codex",
         )
 
-        assert result.startswith("```\nCodex Tools\n")
+        assert result.startswith(f"{EXP_START}Codex Tools\n")
 
     def test_below_limit_renders_all_tools(self) -> None:
         entries = [
@@ -115,8 +123,8 @@ class TestFormatBatchMessage:
         result = format_batch_message([entry])
 
         assert len(result) <= TELEGRAM_TEXT_LIMIT
-        assert result.count("```") == 2
-        assert result.endswith("```")
+        assert result.startswith(EXP_START)
+        assert result.endswith(EXP_END)
         assert "…" in result
 
 
