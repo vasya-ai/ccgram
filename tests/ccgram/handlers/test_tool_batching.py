@@ -357,7 +357,7 @@ class TestProcessBatchTask:
         assert 'Bash: "first" ↻' in edited_text
         assert 'Bash: "second" ↻' in edited_text
 
-    async def test_tool_result_no_matching_entry_is_suppressed_without_flushing(
+    async def test_tool_result_no_matching_entry_updates_pending_without_flushing(
         self, batch_env
     ) -> None:
         bot, _, _ = batch_env
@@ -371,6 +371,26 @@ class TestProcessBatchTask:
         mock_flush.assert_not_awaited()
         assert followup is None
         assert (1, 10) in _active_batches
+        assert _active_batches[(1, 10)].entries[0].status == "success"
+
+    async def test_multiple_unmatched_results_update_pending_entries_in_order(
+        self, batch_env
+    ) -> None:
+        bot, _, _ = batch_env
+        await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
+        await process_tool_event(
+            bot, 1, _make_tool_use(tool_use_id="tu2", text="Bash second", tool_name="Bash")
+        )
+
+        await process_tool_event(bot, 1, _make_tool_result(tool_use_id="other1"))
+        await process_tool_event(
+            bot,
+            1,
+            _make_tool_result(tool_use_id="other2", text="exit code 1"),
+        )
+
+        batch = _active_batches[(1, 10)]
+        assert [entry.status for entry in batch.entries] == ["success", "error"]
 
     async def test_tool_result_no_active_batch_falls_through(self, batch_env) -> None:
         bot, _, _ = batch_env

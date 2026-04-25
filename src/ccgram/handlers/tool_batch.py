@@ -507,6 +507,22 @@ async def _handle_tool_result(
                 entry.status,
             )
             return batch, None
+    text = "\n".join(task.parts) if task.parts else ""
+    for entry in batch.entries:
+        if entry.status == "pending":
+            entry.tool_result_text = text
+            entry.result_text = text
+            entry.status = _status_from_result_text(text)
+            logger.debug(
+                "tool result unmatched mapped window=%s thread=%s tool_id=%s "
+                "mapped_to=%s status=%s",
+                task.window_id,
+                thread_id_or_0,
+                task.tool_use_id,
+                entry.tool_use_id,
+                entry.status,
+            )
+            return batch, None
     logger.debug(
         "tool result unmatched suppressed window=%s thread=%s tool_id=%s entries=%d",
         task.window_id,
