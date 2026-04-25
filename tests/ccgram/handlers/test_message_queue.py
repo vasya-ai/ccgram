@@ -44,6 +44,8 @@ def _content_task(
     content_type: ContentType = "text",
     thread_id: int | None = 42,
     tool_use_id: str | None = None,
+    role: str = "assistant",
+    phase: str | None = None,
 ) -> ContentTask:
     return ContentTask(
         window_id=window_id,
@@ -51,6 +53,8 @@ def _content_task(
         content_type=content_type,
         thread_id=thread_id,
         tool_use_id=tool_use_id,
+        role=role,
+        phase=phase,
     )
 
 
@@ -132,6 +136,21 @@ class TestCanMergeTasks:
         b = _status_task()
         assert not _can_merge_tasks(a, b)
 
+    def test_different_thread_blocks_merge(self):
+        a = _content_task("hello", thread_id=42)
+        b = _content_task("world", thread_id=43)
+        assert not _can_merge_tasks(a, b)
+
+    def test_different_role_blocks_merge(self):
+        a = _content_task("hello", role="assistant")
+        b = _content_task("world", role="user")
+        assert not _can_merge_tasks(a, b)
+
+    def test_different_phase_blocks_merge(self):
+        a = _content_task("hello", phase=None)
+        b = _content_task("world", phase="final_answer")
+        assert not _can_merge_tasks(a, b)
+
 
 class TestMergeContentTasks:
     async def test_merges_consecutive_text_tasks(self, queue, lock):
@@ -211,6 +230,34 @@ class TestDispatch:
         ct = _content_task("hello")
         extra = await _dispatch(bot, 1, ct, queue, lock)
         assert extra == 0
+        mock_flush.assert_not_awaited()
+        mock_process.assert_awaited_once()
+
+    @patch(
+        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
+    )
+    @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
+    @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=False)
+    async def test_final_answer_flushes_active_batch(
+        self, mock_eligible, mock_flush, mock_process, bot, queue, lock
+    ):
+        ct = _content_task("done", phase="final_answer")
+        extra = await _dispatch(bot, 1, ct, queue, lock)
+        assert extra == 0
+        mock_flush.assert_awaited_once_with(bot, 1, ct)
+        mock_process.assert_awaited_once()
+
+    @patch(
+        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
+    )
+    @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
+    @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=False)
+    async def test_user_message_flushes_active_batch(
+        self, mock_eligible, mock_flush, mock_process, bot, queue, lock
+    ):
+        ct = _content_task("prompt", role="user")
+        extra = await _dispatch(bot, 1, ct, queue, lock)
+        assert extra == 0
         mock_flush.assert_awaited_once_with(bot, 1, ct)
         mock_process.assert_awaited_once()
 
@@ -255,7 +302,7 @@ class TestDispatch:
         st = _status_task("Working...")
         extra = await _dispatch(bot, 1, st, queue, lock)
         assert extra == 0
-        mock_flush.assert_awaited_once_with(1, st, bot)
+        mock_flush.assert_not_awaited()
         mock_status.assert_awaited_once()
 
     @patch("ccgram.handlers.message_queue.process_status_clear", new_callable=AsyncMock)

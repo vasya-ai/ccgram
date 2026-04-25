@@ -30,6 +30,8 @@ class TestContentTask:
         assert task.tool_use_id is None
         assert task.tool_name is None
         assert task.thread_id is None
+        assert task.role == "assistant"
+        assert task.phase is None
 
     def test_tool_use_fields(self):
         task = ContentTask(

@@ -401,9 +401,16 @@ async def _send_or_edit_batch(
     from .status_bubble import clear_status_message
 
     batch_text = format_batch_message(batch.entries)
+    await clear_status_message(bot, user_id, thread_id_or_0)
 
     if batch.telegram_msg_id is None:
-        await clear_status_message(bot, user_id, thread_id_or_0)
+        logger.debug(
+            "tool batch send user=%s thread=%s window=%s entries=%d",
+            user_id,
+            thread_id_or_0,
+            batch.window_id,
+            len(batch.entries),
+        )
         await _send_fresh_batch_message(
             bot,
             batch,
@@ -412,6 +419,14 @@ async def _send_or_edit_batch(
             batch_text,
         )
     else:
+        logger.debug(
+            "tool batch edit user=%s thread=%s window=%s message_id=%s entries=%d",
+            user_id,
+            thread_id_or_0,
+            batch.window_id,
+            batch.telegram_msg_id,
+            len(batch.entries),
+        )
         success = await edit_with_fallback(
             bot,
             chat_id,
@@ -444,6 +459,13 @@ async def _send_fresh_batch_message(
     )
     if sent:
         batch.telegram_msg_id = sent.message_id
+        logger.debug(
+            "tool batch tracked thread=%s window=%s message_id=%s entries=%d",
+            batch.thread_id,
+            batch.window_id,
+            sent.message_id,
+            len(batch.entries),
+        )
 
 
 async def _handle_tool_result(
@@ -459,6 +481,13 @@ async def _handle_tool_result(
     could not be absorbed into the batch and should be delivered as content.
     """
     if not task.tool_use_id or not batch:
+        logger.debug(
+            "tool result falls through window=%s thread=%s tool_id=%s has_batch=%s",
+            task.window_id,
+            thread_id_or_0,
+            task.tool_use_id,
+            bool(batch),
+        )
         return None, task
     for entry in batch.entries:
         if entry.tool_use_id == task.tool_use_id:
@@ -466,7 +495,21 @@ async def _handle_tool_result(
             entry.tool_result_text = text
             entry.result_text = text
             entry.status = _status_from_result_text(text)
+            logger.debug(
+                "tool result absorbed window=%s thread=%s tool_id=%s status=%s",
+                task.window_id,
+                thread_id_or_0,
+                task.tool_use_id,
+                entry.status,
+            )
             return batch, None
+    logger.debug(
+        "tool result unmatched window=%s thread=%s tool_id=%s entries=%d",
+        task.window_id,
+        thread_id_or_0,
+        task.tool_use_id,
+        len(batch.entries),
+    )
     await flush_batch(bot, user_id, thread_id_or_0)
     return None, task
 
@@ -484,6 +527,15 @@ def _add_tool_use_entry(
     )
     batch.entries.append(entry)
     batch.total_length += len(entry_text)
+    logger.debug(
+        "tool use added window=%s thread=%s tool_id=%s tool_name=%s entries=%d summary=%r",
+        task.window_id,
+        thread_key(task.thread_id),
+        task.tool_use_id,
+        entry.tool_name,
+        len(batch.entries),
+        entry.summary,
+    )
 
 
 async def process_tool_event(
@@ -541,12 +593,24 @@ async def _handle_tool_use_event(
     should deliver it as regular content (double-overflow), or None on error.
     """
     if batch and batch.window_id != window_id:
+        logger.debug(
+            "tool batch window changed thread=%s old_window=%s new_window=%s",
+            thread_id_or_0,
+            batch.window_id,
+            window_id,
+        )
         await flush_batch(bot, user_id, thread_id_or_0)
         batch = None
 
     if not batch:
         batch = ToolBatch(window_id=window_id, thread_id=thread_id_or_0)
         _active_batches[bkey] = batch
+        logger.debug(
+            "tool batch created user=%s thread=%s window=%s",
+            user_id,
+            thread_id_or_0,
+            window_id,
+        )
 
     _add_tool_use_entry(task, batch)
 
@@ -557,6 +621,16 @@ async def flush_if_active(bot: Bot, user_id: int, task: ContentTask) -> None:
     """Flush any active batch for the same topic before delivering non-batchable content."""
     thread_id_or_0 = thread_key(task.thread_id)
     if has_active_batch(user_id, thread_id_or_0):
+        logger.debug(
+            "tool batch flush before content user=%s thread=%s window=%s "
+            "role=%s phase=%s content_type=%s",
+            user_id,
+            thread_id_or_0,
+            task.window_id,
+            task.role,
+            task.phase,
+            task.content_type,
+        )
         await flush_batch(bot, user_id, thread_id_or_0)
 
 
@@ -571,6 +645,14 @@ async def flush_batch(bot: Bot, user_id: int, thread_id_or_0: int) -> None:
     chat_id = thread_router.resolve_chat_id(user_id, thread_id)
 
     batch_text = format_batch_message(batch.entries)
+    logger.debug(
+        "tool batch flush user=%s thread=%s window=%s message_id=%s entries=%d",
+        user_id,
+        thread_id_or_0,
+        batch.window_id,
+        batch.telegram_msg_id,
+        len(batch.entries),
+    )
 
     if batch.telegram_msg_id is None:
         await _send_fresh_batch_message(

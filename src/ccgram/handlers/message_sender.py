@@ -53,6 +53,15 @@ def _retry_after_seconds(exc: RetryAfter) -> int:
 _last_send_time: dict[int, float] = {}
 _rate_limit_locks: dict[int, asyncio.Lock] = {}
 MESSAGE_SEND_INTERVAL = 0.5  # seconds between messages to same chat
+_LOG_PREVIEW_LIMIT = 220
+
+
+def _log_preview(text: str) -> str:
+    """Return a compact one-line preview for debug logs."""
+    preview = " ".join(text.split())
+    if len(preview) <= _LOG_PREVIEW_LIMIT:
+        return preview
+    return f"{preview[:_LOG_PREVIEW_LIMIT]}..."
 
 
 async def rate_limit_send(chat_id: int) -> None:
@@ -94,6 +103,15 @@ async def _with_entity_fallback(
     Returns the result Message on success, None on failure.
     """
     plain_text, entities = convert_to_entities(text)
+    logger.debug(
+        "telegram %s prepared len=%d entities=%d thread=%s reply_markup=%s preview=%r",
+        context_label,
+        len(plain_text),
+        len(entities),
+        kwargs.get("message_thread_id"),
+        kwargs.get("reply_markup") is not None,
+        _log_preview(plain_text),
+    )
 
     # Phase 1: with entities; Phase 2: plain text fallback.
     # Thread-gone errors (deleted topic) short-circuit both phases.
@@ -103,11 +121,27 @@ async def _with_entity_fallback(
         if phase_entities is not None:
             send_kwargs["entities"] = phase_entities
         try:
-            return await send_fn(plain_text, **send_kwargs)
+            sent = await send_fn(plain_text, **send_kwargs)
+            msg_id = getattr(sent, "message_id", None)
+            logger.debug(
+                "telegram %s ok message_id=%s phase=%s",
+                context_label,
+                msg_id,
+                "entities" if phase_entities is not None else "plain",
+            )
+            return sent
         except RetryAfter as e:
             await asyncio.sleep(_retry_after_seconds(e) + 1)
             try:
-                return await send_fn(plain_text, **send_kwargs)
+                sent = await send_fn(plain_text, **send_kwargs)
+                msg_id = getattr(sent, "message_id", None)
+                logger.debug(
+                    "telegram %s ok after retry message_id=%s phase=%s",
+                    context_label,
+                    msg_id,
+                    "entities" if phase_entities is not None else "plain",
+                )
+                return sent
             except TelegramError as e2:
                 if is_thread_gone(e2):
                     return None
@@ -226,6 +260,16 @@ async def edit_with_fallback(
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     plain_text, entities = convert_to_entities(text)
+    logger.debug(
+        "telegram edit prepared chat=%s message_id=%s len=%d entities=%d "
+        "reply_markup=%s preview=%r",
+        chat_id,
+        message_id,
+        len(plain_text),
+        len(entities),
+        kwargs.get("reply_markup") is not None,
+        _log_preview(plain_text),
+    )
 
     try:
         await bot.edit_message_text(
@@ -235,6 +279,7 @@ async def edit_with_fallback(
             entities=entities,
             **kwargs,
         )
+        logger.debug("telegram edit ok chat=%s message_id=%s phase=entities", chat_id, message_id)
         return True
     except RetryAfter:
         raise
@@ -247,10 +292,20 @@ async def edit_with_fallback(
                 text=fallback,
                 **kwargs,
             )
+            logger.debug(
+                "telegram edit ok chat=%s message_id=%s phase=plain",
+                chat_id,
+                message_id,
+            )
             return True
         except RetryAfter:
             raise
         except TelegramError:
+            logger.debug(
+                "telegram edit failed chat=%s message_id=%s",
+                chat_id,
+                message_id,
+            )
             return False
 
 

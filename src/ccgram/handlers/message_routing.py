@@ -120,6 +120,8 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:  # noqa: C901, 
                 tool_name=msg.tool_name,
                 content_type=msg.content_type,  # type: ignore[arg-type]  # NewMessage.content_type is str, narrows at runtime
                 thread_id=thread_id,
+                role=msg.role,
+                phase=msg.phase,
             )
 
             session = await session_query.resolve_session_for_window(window_id)

@@ -320,6 +320,43 @@ class TestProcessBatchTask:
         assert 'Bash: "make test" ❌' in edited_text
         assert "FAILED test_foo" not in edited_text
 
+    @patch(
+        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
+    )
+    async def test_assistant_text_between_tool_groups_keeps_one_batch(
+        self, mock_process, batch_env
+    ) -> None:
+        bot, mock_send, _ = batch_env
+        queue: asyncio.Queue[MessageTask] = asyncio.Queue()
+        lock = asyncio.Lock()
+
+        await process_tool_event(
+            bot,
+            1,
+            _make_tool_use(tool_use_id="tu1", text="Bash first", tool_name="Bash"),
+        )
+        await _handle_content_task(
+            bot,
+            1,
+            ContentTask(window_id="@0", parts=("assistant update",), thread_id=10),
+            queue,
+            lock,
+        )
+        await process_tool_event(
+            bot,
+            1,
+            _make_tool_use(tool_use_id="tu2", text="Bash second", tool_name="Bash"),
+        )
+
+        batch = _active_batches[(1, 10)]
+        assert len(batch.entries) == 2
+        assert batch.telegram_msg_id == 100
+        mock_send.assert_awaited_once()
+        mock_process.assert_awaited_once()
+        edited_text = bot.edit_message_text.await_args.kwargs["text"]
+        assert 'Bash: "first" ↻' in edited_text
+        assert 'Bash: "second" ↻' in edited_text
+
     async def test_tool_result_no_matching_entry_flushes_and_falls_through(
         self, batch_env
     ) -> None:
@@ -419,7 +456,7 @@ class TestHandleContentTask:
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
-    async def test_text_flushes_active_batch(self, mock_process, mock_flush) -> None:
+    async def test_assistant_text_keeps_active_batch(self, mock_process, mock_flush) -> None:
         bot = AsyncMock()
         queue: asyncio.Queue[MessageTask] = asyncio.Queue()
         lock = asyncio.Lock()
@@ -427,6 +464,24 @@ class TestHandleContentTask:
             content_type="text",
             window_id="@0",
             parts=("Hello",),
+        )
+        await _handle_content_task(bot, 1, task, queue, lock)
+        mock_flush.assert_not_awaited()
+        mock_process.assert_awaited_once()
+
+    @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
+    @patch(
+        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
+    )
+    async def test_final_text_flushes_active_batch(self, mock_process, mock_flush) -> None:
+        bot = AsyncMock()
+        queue: asyncio.Queue[MessageTask] = asyncio.Queue()
+        lock = asyncio.Lock()
+        task = ContentTask(
+            content_type="text",
+            window_id="@0",
+            parts=("Done",),
+            phase="final_answer",
         )
         await _handle_content_task(bot, 1, task, queue, lock)
         mock_flush.assert_awaited_once_with(bot, 1, task)

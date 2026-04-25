@@ -102,6 +102,10 @@ def _can_merge_tasks(base: ContentTask, candidate: MessageTask) -> bool:
         return False
     if base.window_id != candidate.window_id:
         return False
+    if base.thread_id != candidate.thread_id:
+        return False
+    if base.role != candidate.role or base.phase != candidate.phase:
+        return False
     if base.content_type in ("tool_use", "tool_result"):
         return False
     return candidate.content_type not in ("tool_use", "tool_result")
@@ -159,6 +163,8 @@ async def _merge_content_tasks(
             tool_use_id=first.tool_use_id,
             content_type=first.content_type,
             thread_id=first.thread_id,
+            role=first.role,
+            phase=first.phase,
         ),
         merge_count,
     )
@@ -217,7 +223,8 @@ async def _handle_content_task(
             await _process_content_task(bot, user_id, followup)
         return 0
 
-    await flush_if_active(bot, user_id, task)
+    if task.role == "user" or task.phase == "final_answer":
+        await flush_if_active(bot, user_id, task)
 
     merged_task, merge_count = await _merge_content_tasks(queue, task, lock)
     if merge_count > 0:
@@ -238,6 +245,13 @@ async def _flush_batch_for_task(user_id: int, task: MessageTask, bot: Bot) -> No
     """Flush any active batch for the topic that owns this task."""
     tkey = thread_key(task.thread_id)
     if has_active_batch(user_id, tkey):
+        logger.debug(
+            "tool batch flush before task user=%s thread=%s task_type=%s window=%s",
+            user_id,
+            tkey,
+            type(task).__name__,
+            getattr(task, "window_id", None),
+        )
         await flush_batch(bot, user_id, tkey)
 
 
@@ -253,7 +267,6 @@ async def _dispatch(
         case ContentTask() as ct:
             return await _handle_content_task(bot, user_id, ct, queue, lock)
         case StatusUpdateTask() as st:
-            await _flush_batch_for_task(user_id, st, bot)
             collapsed_task, dropped = await _coalesce_status_updates(queue, st, lock)
             if dropped > 0:
                 for _ in range(dropped):
@@ -376,6 +389,8 @@ async def enqueue_content_message(
     tool_name: str | None = None,
     content_type: ContentType = "text",
     thread_id: int | None = None,
+    role: str = "assistant",
+    phase: str | None = None,
 ) -> None:
     """Enqueue a content message task."""
     if _is_ghost_window_task_at_enqueue(window_id):
@@ -389,6 +404,8 @@ async def enqueue_content_message(
         tool_name=tool_name,
         content_type=content_type,
         thread_id=thread_id,
+        role=role,
+        phase=phase,
     )
     queue.put_nowait(task)
 

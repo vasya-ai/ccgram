@@ -222,8 +222,23 @@ async def send_status_text(
     if existing:
         msg_id, stored_wid, last_text, stored_chat_id = existing
         if stored_wid == window_id and text == last_text:
+            logger.debug(
+                "status bubble unchanged user=%s thread=%s window=%s message_id=%s",
+                user_id,
+                thread_id_or_0,
+                window_id,
+                msg_id,
+            )
             return
         if stored_wid == window_id:
+            logger.debug(
+                "status bubble edit user=%s thread=%s window=%s message_id=%s len=%d",
+                user_id,
+                thread_id_or_0,
+                window_id,
+                msg_id,
+                len(text),
+            )
             success = await edit_with_fallback(
                 bot, stored_chat_id, msg_id, text, reply_markup=keyboard
             )
@@ -234,11 +249,25 @@ async def send_status_text(
         else:
             await clear_status_message(bot, user_id, thread_id_or_0)
 
+    logger.debug(
+        "status bubble send user=%s thread=%s window=%s len=%d",
+        user_id,
+        thread_id_or_0,
+        window_id,
+        len(text),
+    )
     sent = await rate_limit_send_message(
         bot, chat_id, text, reply_markup=keyboard, **send_kwargs(thread_id)
     )
     if sent:
         _status_msg_info[skey] = (sent.message_id, window_id, text, chat_id)
+        logger.debug(
+            "status bubble tracked user=%s thread=%s window=%s message_id=%s",
+            user_id,
+            thread_id_or_0,
+            window_id,
+            sent.message_id,
+        )
 
 
 async def clear_status_message(
@@ -251,6 +280,12 @@ async def clear_status_message(
     info = _status_msg_info.pop(skey, None)
     if info:
         msg_id, _, _, chat_id = info
+        logger.debug(
+            "status bubble delete user=%s thread=%s message_id=%s",
+            user_id,
+            thread_id_or_0,
+            msg_id,
+        )
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except TelegramError as e:
@@ -279,6 +314,14 @@ async def convert_status_to_content(
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         return None
 
+    logger.debug(
+        "status bubble convert user=%s thread=%s window=%s message_id=%s len=%d",
+        user_id,
+        thread_id_or_0,
+        window_id,
+        msg_id,
+        len(content_text),
+    )
     success = await edit_with_fallback(
         bot,
         chat_id,
