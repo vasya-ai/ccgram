@@ -19,8 +19,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-import aiofiles
-
 from .config import config
 from .state_persistence import unwired_save
 from .utils import atomic_write_json
@@ -102,8 +100,7 @@ class SessionMapSync:
         if not config.session_map_file.exists():
             return
         try:
-            async with aiofiles.open(config.session_map_file, "r") as f:
-                content = await f.read()
+            content = config.session_map_file.read_text(encoding="utf-8")
             session_map = json.loads(content)
         except (json.JSONDecodeError, OSError):  # fmt: skip
             return
@@ -235,8 +232,7 @@ class SessionMapSync:
         while loop.time() < deadline:
             try:
                 if config.session_map_file.exists():
-                    async with aiofiles.open(config.session_map_file, "r") as f:
-                        content = await f.read()
+                    content = config.session_map_file.read_text(encoding="utf-8")
                     session_map = json.loads(content)
                     info = session_map.get(key, {})
                     if info.get("session_id"):

@@ -129,6 +129,17 @@ class Config:
         self.status_poll_interval = max(
             0.5, float(os.getenv("CCGRAM_STATUS_POLL_INTERVAL", "1.0"))
         )
+        agent_bubble_debounce_env = os.getenv("CCGRAM_AGENT_BUBBLE_DEBOUNCE_MS")
+        if agent_bubble_debounce_env is None:
+            self.agent_bubble_debounce_ms = 1000
+        else:
+            parsed_debounce_ms = max(
+                0,
+                _parse_int_env("CCGRAM_AGENT_BUBBLE_DEBOUNCE_MS", 1000),
+            )
+            self.agent_bubble_debounce_ms = (
+                0 if parsed_debounce_ms == 0 else max(250, parsed_debounce_ms)
+            )
         self.show_idle_ready_status = _parse_bool_env(
             "CCGRAM_SHOW_IDLE_READY_STATUS", True
         )

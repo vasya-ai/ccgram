@@ -13,6 +13,11 @@ from ccgram.session_map import parse_emdash_provider, session_map_sync
 from ccgram.thread_router import thread_router
 from ccgram.window_resolver import EMDASH_SESSION_PREFIX, is_foreign_window
 
+
+async def _inline_to_thread(func, *args, **kwargs):
+    return func(*args, **kwargs)
+
+
 # ── Pure helpers ──────────────────────────────────────────────────────
 
 
@@ -281,7 +286,13 @@ class TestKillWindowForeignGuard:
         from ccgram.tmux_manager import TmuxManager
 
         tm = TmuxManager(session_name="test")
-        with patch.object(tm, "get_session", return_value=None):
+        with (
+            patch.object(tm, "get_session", return_value=None),
+            patch(
+                "ccgram.tmux_manager.asyncio.to_thread",
+                side_effect=_inline_to_thread,
+            ),
+        ):
             result = await tm.kill_window("@5")
         assert result is False  # no session, but didn't skip
 

@@ -47,6 +47,10 @@ def _make_context() -> MagicMock:
     return ctx
 
 
+async def _inline_to_thread(func, *args, **kwargs):
+    return func(*args, **kwargs)
+
+
 @pytest.fixture(autouse=True)
 def _allow_user():
     with patch("ccgram.config.Config.is_user_allowed", return_value=True):
@@ -320,9 +324,19 @@ class TestForwardCommandResolution:
             has_output_since=MagicMock(return_value=False),
         )
 
-        with patch(
-            "ccgram.handlers.command_orchestration.get_provider_for_window",
-            return_value=codex_provider,
+        with (
+            patch(
+                "ccgram.handlers.command_orchestration.get_provider_for_window",
+                return_value=codex_provider,
+            ),
+            patch(
+                "ccgram.handlers.command_orchestration.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "ccgram.handlers.command_orchestration.asyncio.to_thread",
+                side_effect=_inline_to_thread,
+            ),
         ):
             update = _make_update(text="/status")
             await forward_command_handler(update, _make_context())
@@ -394,6 +408,10 @@ class TestForwardCommandResolution:
                 "ccgram.handlers.command_orchestration.asyncio.sleep",
                 new_callable=AsyncMock,
             ),
+            patch(
+                "ccgram.handlers.command_orchestration.asyncio.to_thread",
+                side_effect=_inline_to_thread,
+            ),
         ):
             update = _make_update(text="/status")
             await forward_command_handler(update, _make_context())
@@ -429,11 +447,15 @@ class TestCommandFailureProbe:
             ),
         )
 
-        result = await _probe_transcript_command_error(
-            provider,  # type: ignore[arg-type]
-            str(transcript),
-            len(prefix),
-        )
+        with patch(
+            "ccgram.handlers.command_orchestration.asyncio.to_thread",
+            side_effect=_inline_to_thread,
+        ):
+            result = await _probe_transcript_command_error(
+                provider,  # type: ignore[arg-type]
+                str(transcript),
+                len(prefix),
+            )
         assert result == "unknown command: /status"
 
     async def test_probe_transcript_whole_file_not_implemented_returns_none(
@@ -450,7 +472,11 @@ class TestCommandFailureProbe:
             parse_transcript_entries=lambda entries, pending_tools: ([], pending_tools),
         )
 
-        result = await _probe_transcript_command_error(provider, str(transcript), 0)  # type: ignore[arg-type]
+        with patch(
+            "ccgram.handlers.command_orchestration.asyncio.to_thread",
+            side_effect=_inline_to_thread,
+        ):
+            result = await _probe_transcript_command_error(provider, str(transcript), 0)  # type: ignore[arg-type]
         assert result is None
 
     async def test_surfaces_transcript_error(self) -> None:

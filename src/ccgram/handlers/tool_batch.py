@@ -16,25 +16,33 @@ Key components:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
 import re
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
 import structlog
 from telegram import Bot
 from telegram.error import TelegramError
+from telegramify_markdown import utf16_len as _utf16_len
 
 from ..expandable_quote import EXPANDABLE_QUOTE_END, EXPANDABLE_QUOTE_START
 from ..telegram_sender import split_message
-from ..utils import atomic_write_json, ccgram_dir
+from ..utils import atomic_write_json, ccgram_dir, task_done_callback
 from ..thread_router import thread_router
 from ..topic_state_registry import topic_state
-from .message_sender import edit_with_fallback, rate_limit_send_message, send_kwargs
+from .message_sender import (
+    EditOutcome,
+    edit_with_entities_outcome,
+    rate_limit_send_message_strict as rate_limit_send_message,
+    send_kwargs,
+)
 from .message_task import ContentTask, thread_key
 
 logger = structlog.get_logger()
@@ -46,9 +54,17 @@ _TOOL_LINE_ELLIPSIS = "…"
 _TOOL_BUBBLE_RENDERED_LIMIT = 3800
 _PERSISTED_BATCH_STATE_VERSION = 1
 _PERSISTED_BATCH_MAX_AGE_SECONDS = 6 * 60 * 60
+_AGENT_BUBBLE_RETRY_BASE_SECONDS = 1.0
+_AGENT_BUBBLE_RETRY_MAX_SECONDS = 15.0
 
 ToolStatus = Literal["pending", "success", "error"]
 AgentBubbleSegmentKind = Literal["text", "tools"]
+
+
+class _PageSyncResult(Enum):
+    SUCCESS = "success"
+    TRANSIENT_FAILURE = "transient_failure"
+    PERMANENT_FAILURE = "permanent_failure"
 
 
 @dataclass
@@ -102,8 +118,19 @@ class ToolBatch:
     total_length: int = 0  # Legacy metric; no longer used as an overflow trigger.
 
 
+@dataclass
+class _DeliveryState:
+    dirty_version: int = 0
+    flushed_version: int = 0
+    permanent_failure_version: int = 0
+    scheduled_task: asyncio.Task[None] | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    retry_count: int = 0
+
+
 # Active tool batches: (user_id, thread_id_or_0) -> ToolBatch
 _active_batches: dict[tuple[int, int], ToolBatch] = {}
+_delivery_states: dict[tuple[int, int], _DeliveryState] = {}
 _persistent_batches_loaded = False
 
 _MARKDOWN_TOOL_PREFIX_RE = re.compile(r"\*\*([^*]+)\*\*\s*(.*)$")
@@ -232,6 +259,38 @@ def _render_tool_bubble_body(
     return "\n".join(body_lines)
 
 
+def _telegram_rendered_len(text: str) -> int:
+    budget_text = text.replace(EXPANDABLE_QUOTE_START, "").replace(
+        EXPANDABLE_QUOTE_END,
+        "",
+    )
+    return _utf16_len(budget_text)
+
+
+def _fits_rendered_limit(text: str, limit: int = _TOOL_BUBBLE_RENDERED_LIMIT) -> bool:
+    return _telegram_rendered_len(text) <= limit
+
+
+def _truncate_rendered_text(text: str, limit: int) -> str:
+    if _fits_rendered_limit(text, limit):
+        return text
+    if limit <= _telegram_rendered_len(_TOOL_LINE_ELLIPSIS):
+        return _TOOL_LINE_ELLIPSIS
+
+    low = 0
+    high = len(text)
+    best = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = f"{text[:mid]}{_TOOL_LINE_ELLIPSIS}"
+        if _fits_rendered_limit(candidate, limit):
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best or _TOOL_LINE_ELLIPSIS
+
+
 class _AgentPageBuilder:
     """Incrementally build ordered pages without dropping older content."""
 
@@ -275,14 +334,14 @@ class _AgentPageBuilder:
     def _current_text(self) -> str:
         return "\n\n".join(self._parts)
 
-    def _separator_len(self) -> int:
-        return 2 if self._parts else 0
-
     def _block_fits_current(self, block: str) -> bool:
-        return (
-            len(self._current_text()) + self._separator_len() + len(block)
-            <= _TOOL_BUBBLE_RENDERED_LIMIT
+        separator = "\n\n" if self._parts else ""
+        candidate = (
+            block
+            if not self._parts
+            else f"{self._current_text()}{separator}{block}"
         )
+        return _fits_rendered_limit(candidate)
 
     def _quote_fits_current(self, lines: list[str], title: str) -> bool:
         return self._block_fits_current(_render_tool_bubble(lines, title))
@@ -319,11 +378,11 @@ def _with_page_footers(pages: list[str]) -> list[str]:
     rendered: list[str] = []
     for index, page in enumerate(pages, 1):
         footer = f"\n\n[{index}/{total}]"
-        if len(page) + len(footer) <= TELEGRAM_TEXT_LIMIT:
+        if _fits_rendered_limit(f"{page}{footer}", TELEGRAM_TEXT_LIMIT):
             rendered.append(f"{page}{footer}")
         else:
-            available = TELEGRAM_TEXT_LIMIT - len(footer) - len(_TOOL_LINE_ELLIPSIS)
-            rendered.append(f"{page[:available]}{_TOOL_LINE_ELLIPSIS}{footer}")
+            available = TELEGRAM_TEXT_LIMIT - _telegram_rendered_len(footer)
+            rendered.append(f"{_truncate_rendered_text(page, available)}{footer}")
     return rendered
 
 
@@ -335,25 +394,29 @@ def _tool_bubble_fits(
     body = _render_tool_bubble_body(visible_lines, title, hidden_count)
     rendered = f"{EXPANDABLE_QUOTE_START}{body}{EXPANDABLE_QUOTE_END}"
     return (
-        len(body) <= _TOOL_BUBBLE_RENDERED_LIMIT
-        and len(rendered) <= TELEGRAM_TEXT_LIMIT
+        _telegram_rendered_len(body) <= _TOOL_BUBBLE_RENDERED_LIMIT
+        and _telegram_rendered_len(rendered) <= TELEGRAM_TEXT_LIMIT
     )
 
 
 def _truncate_line_to_fit(line: str, title: str, hidden_count: int) -> str:
-    body_overhead = len(_render_tool_bubble_body(["x"], title, hidden_count)) - 1
-    rendered_overhead = len(_render_tool_bubble(["x"], title, hidden_count)) - 1
+    body_overhead = (
+        _telegram_rendered_len(_render_tool_bubble_body(["x"], title, hidden_count)) - 1
+    )
+    rendered_overhead = (
+        _telegram_rendered_len(_render_tool_bubble(["x"], title, hidden_count)) - 1
+    )
     available = min(
         _TOOL_BUBBLE_RENDERED_LIMIT - body_overhead,
         TELEGRAM_TEXT_LIMIT - rendered_overhead,
     )
     if available <= 0:
         return ""
-    if len(line) <= available:
+    if _telegram_rendered_len(line) <= available:
         return line
-    if available <= len(_TOOL_LINE_ELLIPSIS):
+    if available <= _telegram_rendered_len(_TOOL_LINE_ELLIPSIS):
         return _TOOL_LINE_ELLIPSIS[:available]
-    return f"{line[: available - len(_TOOL_LINE_ELLIPSIS)]}{_TOOL_LINE_ELLIPSIS}"
+    return _truncate_rendered_text(line, available)
 
 
 def _tool_bubble_title(provider_label: str | None) -> str:
@@ -746,24 +809,186 @@ def _persist_active_batches() -> None:
         logger.warning("failed to persist tool batches: %s", exc)
 
 
-async def _send_or_edit_batch(
+def _get_delivery_state(key: tuple[int, int]) -> _DeliveryState:
+    state = _delivery_states.get(key)
+    if state is None:
+        state = _DeliveryState()
+        _delivery_states[key] = state
+    return state
+
+
+def _cancel_delivery_state(key: tuple[int, int]) -> None:
+    state = _delivery_states.pop(key, None)
+    if state is None:
+        return
+    task = state.scheduled_task
+    if task is not None and not task.done():
+        task.cancel()
+
+
+async def shutdown_delivery_tasks() -> None:
+    """Cancel pending background agent-bubble delivery tasks."""
+    tasks: list[asyncio.Task[None]] = []
+    for state in list(_delivery_states.values()):
+        task = state.scheduled_task
+        if task is not None and not task.done():
+            task.cancel()
+            tasks.append(task)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _delivery_states.clear()
+
+
+async def wait_for_pending_deliveries() -> None:
+    """Test/support helper: wait for currently scheduled delivery tasks."""
+    tasks = [
+        task
+        for state in _delivery_states.values()
+        for task in [state.scheduled_task]
+        if task is not None and not task.done()
+    ]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _agent_bubble_debounce_seconds() -> float:
+    from ..config import config
+
+    return max(0, config.agent_bubble_debounce_ms) / 1000
+
+
+def _delivery_retry_delay(state: _DeliveryState) -> float:
+    exponent = min(max(state.retry_count - 1, 0), 4)
+    return min(
+        _AGENT_BUBBLE_RETRY_MAX_SECONDS,
+        _AGENT_BUBBLE_RETRY_BASE_SECONDS * (2**exponent),
+    )
+
+
+async def _mark_batch_dirty(
     bot: Bot,
     user_id: int,
-    batch: ToolBatch,
-    chat_id: int,
-    raw_thread_id: int | None,
     thread_id_or_0: int,
+    *,
+    immediate: bool = False,
+) -> bool:
+    """Mark the agent bubble dirty and schedule one serialized delivery."""
+    key = (user_id, thread_id_or_0)
+    state = _get_delivery_state(key)
+    state.dirty_version += 1
+    if immediate:
+        return await _flush_delivery_now(bot, user_id, thread_id_or_0, force=True)
+    delay = _agent_bubble_debounce_seconds()
+    if delay <= 0:
+        return await _flush_delivery_now(bot, user_id, thread_id_or_0)
+    _ensure_delivery_task(bot, user_id, thread_id_or_0, delay)
+    return True
+
+
+def _ensure_delivery_task(
+    bot: Bot,
+    user_id: int,
+    thread_id_or_0: int,
+    delay: float,
 ) -> None:
-    """Send or edit all Telegram pages for the active agent turn."""
-    await _sync_batch_pages(
-        bot,
-        user_id,
-        batch,
-        chat_id,
-        raw_thread_id,
-        thread_id_or_0,
-        convert_status=True,
+    key = (user_id, thread_id_or_0)
+    state = _get_delivery_state(key)
+    existing = state.scheduled_task
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(
+        _delayed_delivery_flush(bot, user_id, thread_id_or_0, delay)
     )
+    task.add_done_callback(task_done_callback)
+    state.scheduled_task = task
+
+
+async def _delayed_delivery_flush(
+    bot: Bot,
+    user_id: int,
+    thread_id_or_0: int,
+    delay: float,
+) -> None:
+    key = (user_id, thread_id_or_0)
+    current_task = asyncio.current_task()
+    try:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if key in _active_batches:
+            await _flush_delivery_now(bot, user_id, thread_id_or_0)
+    finally:
+        state = _delivery_states.get(key)
+        if state is not None:
+            if state.scheduled_task is current_task:
+                state.scheduled_task = None
+            if _should_reschedule_delivery(key, state):
+                _ensure_delivery_task(
+                    bot,
+                    user_id,
+                    thread_id_or_0,
+                    _delivery_retry_delay(state),
+                )
+
+
+def _should_reschedule_delivery(
+    key: tuple[int, int],
+    state: _DeliveryState,
+) -> bool:
+    if key not in _active_batches:
+        return False
+    if state.dirty_version <= state.flushed_version:
+        return False
+    return state.permanent_failure_version != state.dirty_version
+
+
+async def _flush_delivery_now(
+    bot: Bot,
+    user_id: int,
+    thread_id_or_0: int,
+    *,
+    force: bool = False,
+) -> bool:
+    key = (user_id, thread_id_or_0)
+    state = _get_delivery_state(key)
+    async with state.lock:
+        target_version = state.dirty_version
+        if not force and state.flushed_version >= target_version:
+            return True
+        if not force and state.permanent_failure_version == target_version:
+            return False
+
+        batch = _active_batches.get(key)
+        if not batch or not _render_segments(batch):
+            state.flushed_version = target_version
+            state.retry_count = 0
+            return True
+
+        thread_id: int | None = thread_id_or_0 if thread_id_or_0 != 0 else None
+        chat_id = thread_router.resolve_chat_id(user_id, thread_id)
+        result = await _sync_batch_pages(
+            bot,
+            user_id,
+            batch,
+            chat_id,
+            thread_id,
+            thread_id_or_0,
+            clear_status=not batch.telegram_msg_ids,
+        )
+        if result == _PageSyncResult.SUCCESS:
+            state.flushed_version = target_version
+            state.retry_count = 0
+            state.permanent_failure_version = 0
+            _persist_active_batches()
+            return True
+        if result == _PageSyncResult.PERMANENT_FAILURE:
+            state.permanent_failure_version = target_version
+            state.retry_count = 0
+            _persist_active_batches()
+            return False
+
+        state.retry_count += 1
+        _persist_active_batches()
+        return False
 
 
 async def _sync_batch_pages(
@@ -774,16 +999,14 @@ async def _sync_batch_pages(
     raw_thread_id: int | None,
     thread_id_or_0: int,
     *,
-    convert_status: bool,
-) -> None:
+    clear_status: bool,
+) -> _PageSyncResult:
     pages = _prepare_batch_pages(batch)
     if not pages:
-        return
-    if convert_status and not batch.telegram_msg_ids:
-        await _convert_or_clear_status(
-            bot, user_id, batch, thread_id_or_0, pages[0]
-        )
-    await _sync_rendered_pages(bot, user_id, batch, chat_id, raw_thread_id, pages)
+        return _PageSyncResult.SUCCESS
+    if clear_status:
+        await _clear_status_before_agent_bubble(bot, user_id, thread_id_or_0)
+    return await _sync_rendered_pages(bot, user_id, batch, chat_id, raw_thread_id, pages)
 
 
 def _prepare_batch_pages(batch: ToolBatch) -> list[str]:
@@ -793,28 +1016,14 @@ def _prepare_batch_pages(batch: ToolBatch) -> list[str]:
     return pages
 
 
-async def _convert_or_clear_status(
+async def _clear_status_before_agent_bubble(
     bot: Bot,
     user_id: int,
-    batch: ToolBatch,
     thread_id_or_0: int,
-    first_page: str,
 ) -> None:
-    from .status_bubble import clear_status_message, convert_status_to_content
+    from .status_bubble import clear_status_message
 
-    converted_msg_id = await convert_status_to_content(
-        bot,
-        user_id,
-        thread_id_or_0,
-        batch.window_id,
-        first_page,
-    )
-    if converted_msg_id is None:
-        await clear_status_message(bot, user_id, thread_id_or_0)
-        return
-    batch.telegram_msg_ids.append(converted_msg_id)
-    batch.telegram_msg_id = converted_msg_id
-    batch.rendered_pages = [first_page]
+    await clear_status_message(bot, user_id, thread_id_or_0)
 
 
 async def _sync_rendered_pages(
@@ -824,10 +1033,10 @@ async def _sync_rendered_pages(
     chat_id: int,
     raw_thread_id: int | None,
     pages: list[str],
-) -> None:
+) -> _PageSyncResult:
     disable_notification = not _batch_has_text(batch)
     for index, page in enumerate(pages):
-        await _sync_one_page(
+        result = await _sync_one_page(
             bot,
             user_id,
             batch,
@@ -838,9 +1047,12 @@ async def _sync_rendered_pages(
             page,
             disable_notification,
         )
+        if result != _PageSyncResult.SUCCESS:
+            return result
     await _delete_stale_pages(bot, batch, chat_id, len(pages))
     batch.telegram_msg_id = batch.telegram_msg_ids[0] if batch.telegram_msg_ids else None
-    batch.rendered_pages = pages
+    batch.rendered_pages = list(pages)
+    return _PageSyncResult.SUCCESS
 
 
 async def _sync_one_page(
@@ -853,12 +1065,18 @@ async def _sync_one_page(
     index: int,
     page: str,
     disable_notification: bool,
-) -> None:
+) -> _PageSyncResult:
     if index < len(batch.telegram_msg_ids):
         if index < len(batch.rendered_pages) and batch.rendered_pages[index] == page:
-            return
-        if await _edit_page(bot, user_id, batch, chat_id, pages, index, page):
-            return
+            return _PageSyncResult.SUCCESS
+        outcome = await _edit_page(bot, user_id, batch, chat_id, pages, index, page)
+        if outcome in (EditOutcome.APPLIED, EditOutcome.NOT_MODIFIED):
+            return _PageSyncResult.SUCCESS
+        if outcome != EditOutcome.MISSING:
+            if outcome == EditOutcome.PERMANENT_FAILURE:
+                return _PageSyncResult.PERMANENT_FAILURE
+            return _PageSyncResult.TRANSIENT_FAILURE
+
     sent = await _send_fresh_batch_message(
         bot,
         batch,
@@ -869,6 +1087,8 @@ async def _sync_one_page(
     )
     if sent is not None:
         _store_page_message_id(batch, index, sent)
+        return _PageSyncResult.SUCCESS
+    return _PageSyncResult.TRANSIENT_FAILURE
 
 
 async def _edit_page(
@@ -879,7 +1099,7 @@ async def _edit_page(
     pages: list[str],
     index: int,
     page: str,
-) -> bool:
+) -> EditOutcome:
     msg_id = batch.telegram_msg_ids[index]
     logger.debug(
         "agent bubble edit user=%s thread=%s window=%s message_id=%s page=%d/%d",
@@ -890,7 +1110,7 @@ async def _edit_page(
         index + 1,
         len(pages),
     )
-    return await edit_with_fallback(bot, chat_id, msg_id, page)
+    return await edit_with_entities_outcome(bot, chat_id, msg_id, page)
 
 
 def _store_page_message_id(batch: ToolBatch, index: int, msg_id: int) -> None:
@@ -929,7 +1149,6 @@ async def _send_fresh_batch_message(
         disable_notification=disable_notification,
     )
     if sent:
-        batch.telegram_msg_id = sent.message_id
         logger.debug(
             "tool batch tracked thread=%s window=%s message_id=%s entries=%d",
             batch.thread_id,
@@ -1081,7 +1300,6 @@ async def process_tool_event(
     window_id = task.window_id
     thread_id_or_0 = thread_key(task.thread_id)
     bkey = (user_id, thread_id_or_0)
-    chat_id = thread_router.resolve_chat_id(user_id, task.thread_id)
     _load_active_batches_if_needed()
     batch = _active_batches.get(bkey)
 
@@ -1103,9 +1321,7 @@ async def process_tool_event(
     else:
         return task
 
-    await _send_or_edit_batch(
-        bot, user_id, batch, chat_id, task.thread_id, thread_id_or_0
-    )
+    await _mark_batch_dirty(bot, user_id, thread_id_or_0)
     _persist_active_batches()
     return None
 
@@ -1118,7 +1334,6 @@ async def process_agent_message(bot: Bot, user_id: int, task: ContentTask) -> No
     window_id = task.window_id
     thread_id_or_0 = thread_key(task.thread_id)
     bkey = (user_id, thread_id_or_0)
-    chat_id = thread_router.resolve_chat_id(user_id, task.thread_id)
     _load_active_batches_if_needed()
     batch = _active_batches.get(bkey)
 
@@ -1133,12 +1348,15 @@ async def process_agent_message(bot: Bot, user_id: int, task: ContentTask) -> No
     for part in task.parts:
         _append_text_segment(batch, part)
 
-    await _send_or_edit_batch(
-        bot, user_id, batch, chat_id, task.thread_id, thread_id_or_0
+    await _mark_batch_dirty(
+        bot,
+        user_id,
+        thread_id_or_0,
+        immediate=task.phase == "final_answer",
     )
-
     if task.phase == "final_answer":
         _active_batches.pop(bkey, None)
+        _cancel_delivery_state(bkey)
     _persist_active_batches()
 
 
@@ -1202,13 +1420,13 @@ async def flush_batch(bot: Bot, user_id: int, thread_id_or_0: int) -> None:
     """Finalize the active batch: do a final edit and clear state."""
     _load_active_batches_if_needed()
     bkey = (user_id, thread_id_or_0)
-    batch = _active_batches.pop(bkey, None)
+    batch = _active_batches.get(bkey)
     if not batch or not _render_segments(batch):
+        _active_batches.pop(bkey, None)
+        _delivery_states.pop(bkey, None)
         _persist_active_batches()
         return
 
-    thread_id: int | None = thread_id_or_0 if thread_id_or_0 != 0 else None
-    chat_id = thread_router.resolve_chat_id(user_id, thread_id)
     logger.debug(
         "agent bubble flush user=%s thread=%s window=%s message_id=%s entries=%d",
         user_id,
@@ -1217,15 +1435,11 @@ async def flush_batch(bot: Bot, user_id: int, thread_id_or_0: int) -> None:
         batch.telegram_msg_id,
         len(batch.entries),
     )
-    await _sync_batch_pages(
-        bot,
-        user_id,
-        batch,
-        chat_id,
-        thread_id,
-        thread_id_or_0,
-        convert_status=False,
-    )
+    state = _get_delivery_state(bkey)
+    state.dirty_version += 1
+    await _flush_delivery_now(bot, user_id, thread_id_or_0, force=True)
+    _active_batches.pop(bkey, None)
+    _cancel_delivery_state(bkey)
     _persist_active_batches()
 
 
@@ -1239,10 +1453,14 @@ def has_active_batch(user_id: int, thread_id_or_0: int) -> bool:
 def clear_batch_for_topic(user_id: int, thread_id: int | None = None) -> None:
     """Clear active batch for a specific topic (called on topic cleanup)."""
     _load_active_batches_if_needed()
-    _active_batches.pop((user_id, thread_key(thread_id)), None)
+    key = (user_id, thread_key(thread_id))
+    _active_batches.pop(key, None)
+    _cancel_delivery_state(key)
     _persist_active_batches()
 
 
 def clear_all_batches() -> None:
     """Clear process-local batches without deleting restart recovery state."""
     _active_batches.clear()
+    for key in list(_delivery_states):
+        _cancel_delivery_state(key)

@@ -17,6 +17,7 @@ import contextlib
 import structlog
 import time
 from collections.abc import Awaitable, Callable
+from enum import Enum
 from typing import Any
 
 from telegram import Bot, CallbackQuery, LinkPreviewOptions, Message, ReactionTypeEmoji
@@ -25,6 +26,16 @@ from telegram.error import BadRequest, RetryAfter, TelegramError
 from ..entity_formatting import convert_to_entities
 
 logger = structlog.get_logger()
+
+
+class EditOutcome(Enum):
+    """Explicit result for entity-preserving Telegram edits."""
+
+    APPLIED = "applied"
+    NOT_MODIFIED = "not_modified"
+    MISSING = "missing"
+    TRANSIENT_FAILURE = "transient_failure"
+    PERMANENT_FAILURE = "permanent_failure"
 
 
 def is_thread_gone(exc: TelegramError) -> bool:
@@ -40,6 +51,33 @@ def is_message_not_modified(exc: TelegramError) -> bool:
     if isinstance(exc, BadRequest):
         msg = exc.message.lower()
         return "message is not modified" in msg or "not modified" in msg
+    return False
+
+
+def is_message_missing(exc: TelegramError) -> bool:
+    """Check if Telegram says the edited message no longer exists."""
+    if isinstance(exc, BadRequest):
+        msg = exc.message.lower()
+        return (
+            "message to edit not found" in msg
+            or "message not found" in msg
+            or "message_id_invalid" in msg
+        )
+    return False
+
+
+def is_permanent_edit_failure(exc: TelegramError) -> bool:
+    """Check if retrying the same edit payload is unlikely to succeed."""
+    if isinstance(exc, BadRequest):
+        msg = exc.message.lower()
+        return (
+            "message is too long" in msg
+            or "message_too_long" in msg
+            or "can't parse entities" in msg
+            or "entity" in msg
+            or "message can't be edited" in msg
+            or "message cannot be edited" in msg
+        )
     return False
 
 
@@ -202,6 +240,44 @@ async def rate_limit_send_message(
     return await _send_with_fallback(bot, chat_id, text, **kwargs)
 
 
+async def rate_limit_send_message_strict(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    **kwargs: Any,
+) -> Message | None:
+    """Rate-limited send with entities only, no plain-text fallback."""
+    kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
+    plain_text, entities = convert_to_entities(text)
+    await rate_limit_send(chat_id)
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=plain_text,
+            entities=entities,
+            **kwargs,
+        )
+        logger.debug(
+            "telegram strict send ok chat=%s message_id=%s entities=%d",
+            chat_id,
+            getattr(sent, "message_id", None),
+            len(entities),
+        )
+        return sent
+    except RetryAfter as exc:
+        logger.warning(
+            "telegram strict send retry-after chat=%s retry_after=%s",
+            chat_id,
+            exc.retry_after,
+        )
+        return None
+    except TelegramError as exc:
+        if is_thread_gone(exc):
+            return None
+        logger.debug("telegram strict send failed chat=%s error=%s", chat_id, exc)
+        return None
+
+
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message | None:
     """Reply with entity formatting, falling back to plain text on failure.
 
@@ -332,6 +408,81 @@ async def edit_with_fallback(
                 message_id,
             )
             return False
+
+
+async def edit_with_entities_outcome(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    **kwargs: Any,
+) -> EditOutcome:
+    """Edit with entities only and return a structured outcome."""
+    kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
+    plain_text, entities = convert_to_entities(text)
+    logger.debug(
+        "telegram strict edit prepared chat=%s message_id=%s len=%d entities=%d "
+        "reply_markup=%s preview=%r",
+        chat_id,
+        message_id,
+        len(plain_text),
+        len(entities),
+        kwargs.get("reply_markup") is not None,
+        _log_preview(plain_text),
+    )
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=plain_text,
+            entities=entities,
+            **kwargs,
+        )
+        logger.debug(
+            "telegram strict edit ok chat=%s message_id=%s phase=entities",
+            chat_id,
+            message_id,
+        )
+        return EditOutcome.APPLIED
+    except RetryAfter as exc:
+        logger.warning(
+            "telegram strict edit retry-after chat=%s message_id=%s retry_after=%s",
+            chat_id,
+            message_id,
+            exc.retry_after,
+        )
+        return EditOutcome.TRANSIENT_FAILURE
+    except TelegramError as exc:
+        if is_message_not_modified(exc):
+            logger.debug(
+                "telegram strict edit not modified chat=%s message_id=%s",
+                chat_id,
+                message_id,
+            )
+            return EditOutcome.NOT_MODIFIED
+        if is_message_missing(exc):
+            logger.debug(
+                "telegram strict edit missing chat=%s message_id=%s error=%s",
+                chat_id,
+                message_id,
+                exc,
+            )
+            return EditOutcome.MISSING
+        if is_permanent_edit_failure(exc):
+            logger.warning(
+                "telegram strict edit permanent failure chat=%s message_id=%s error=%s",
+                chat_id,
+                message_id,
+                exc,
+            )
+            return EditOutcome.PERMANENT_FAILURE
+        logger.debug(
+            "telegram strict edit transient failure chat=%s message_id=%s error=%s",
+            chat_id,
+            message_id,
+            exc,
+        )
+        return EditOutcome.TRANSIENT_FAILURE
 
 
 async def ack_reaction(bot: Bot, chat_id: int, message_id: int) -> None:

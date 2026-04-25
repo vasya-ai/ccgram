@@ -40,6 +40,7 @@ from .tool_batch import (
     flush_if_active,
     has_active_batch,
     process_agent_message,
+    shutdown_delivery_tasks,
     process_tool_event,
 )
 
@@ -560,6 +561,7 @@ async def shutdown_workers() -> None:
         worker.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker
+    await shutdown_delivery_tasks()
     _queue_workers.clear()
     _message_queues.clear()
     _queue_locks.clear()

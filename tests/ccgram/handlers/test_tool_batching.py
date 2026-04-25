@@ -20,13 +20,18 @@ from ccgram.handlers.tool_batch import (
     ToolBatch,
     ToolBatchEntry,
     _active_batches,
+    _delivery_states,
+    _flush_delivery_now,
     clear_all_batches,
     clear_batch_for_topic,
     flush_batch,
     format_agent_pages,
     format_batch_message,
+    process_agent_message,
     process_tool_event,
+    shutdown_delivery_tasks,
 )
+from ccgram.handlers.message_sender import EditOutcome
 from ccgram.session import (
     WindowState,
 )
@@ -55,10 +60,13 @@ def _clear_batches(tmp_path, monkeypatch):
 
     state_path = tmp_path / "tool_batches.json"
     monkeypatch.setattr(tool_batch, "_tool_batch_state_path", lambda: state_path)
+    monkeypatch.setattr(tool_batch, "_agent_bubble_debounce_seconds", lambda: 0)
     tool_batch._persistent_batches_loaded = False
     _active_batches.clear()
+    _delivery_states.clear()
     yield
     _active_batches.clear()
+    _delivery_states.clear()
     tool_batch._persistent_batches_loaded = False
 
 
@@ -132,6 +140,47 @@ class TestFormatBatchMessage:
         assert "run-0" in pages[0]
         assert "run-99" in pages[-1]
 
+    def test_long_text_tool_text_tool_flow_paginates_in_order(self) -> None:
+        first_entries = [
+            ToolBatchEntry(
+                f"a{i}",
+                f"Bash alpha-command-{i}-" + ("x" * 160),
+                tool_name="Bash",
+            )
+            for i in range(45)
+        ]
+        second_entries = [
+            ToolBatchEntry(
+                f"b{i}",
+                f"Read beta-file-{i}-" + ("y" * 160),
+                tool_name="Read",
+            )
+            for i in range(45)
+        ]
+
+        pages = format_agent_pages(
+            [
+                AgentBubbleSegment("text", text="first assistant note"),
+                AgentBubbleSegment("tools", entries=first_entries),
+                AgentBubbleSegment("text", text="second assistant note"),
+                AgentBubbleSegment("tools", entries=second_entries),
+            ]
+        )
+
+        joined = "\n".join(pages)
+        assert len(pages) > 1
+        assert all(len(page) <= TELEGRAM_TEXT_LIMIT for page in pages)
+        assert pages[0].endswith(f"[1/{len(pages)}]")
+        assert pages[-1].endswith(f"[{len(pages)}/{len(pages)}]")
+        assert "first assistant note" in joined
+        assert "alpha-command-0" in joined
+        assert "second assistant note" in joined
+        assert "beta-file-44" in joined
+        assert joined.index("first assistant note") < joined.index("alpha-command-0")
+        assert joined.index("alpha-command-44") < joined.index("second assistant note")
+        assert joined.index("second assistant note") < joined.index("beta-file-0")
+        assert all(EXP_START in page and EXP_END in page for page in pages)
+
 
 class TestBatchDataStructures:
     def test_tool_batch_entry_defaults(self) -> None:
@@ -180,8 +229,13 @@ class TestProcessBatchTask:
         mock_send.assert_awaited_once()
         assert mock_send.await_args.kwargs["disable_notification"] is True
 
-    async def test_many_tool_calls_keep_one_telegram_message(self, batch_env) -> None:
+    async def test_many_tool_calls_coalesce_into_one_scheduled_flush(
+        self, batch_env, monkeypatch
+    ) -> None:
+        from ccgram.handlers import tool_batch
+
         bot, mock_send, _ = batch_env
+        monkeypatch.setattr(tool_batch, "_agent_bubble_debounce_seconds", lambda: 10)
 
         for i in range(20):
             await process_tool_event(
@@ -192,9 +246,15 @@ class TestProcessBatchTask:
 
         batch = _active_batches[(1, 10)]
         assert len(batch.entries) == 20
-        assert batch.telegram_msg_id == 100
+        assert batch.telegram_msg_id is None
+        assert _delivery_states[(1, 10)].dirty_version == 20
+        assert _delivery_states[(1, 10)].scheduled_task is not None
+        mock_send.assert_not_awaited()
+        bot.edit_message_text.assert_not_awaited()
+
+        await flush_batch(bot, 1, 10)
         mock_send.assert_awaited_once()
-        assert bot.edit_message_text.await_count == 19
+        bot.edit_message_text.assert_not_awaited()
 
     async def test_overflow_creates_ordered_paginated_bubbles(
         self, batch_env
@@ -357,9 +417,9 @@ class TestProcessBatchTask:
         mock_send.side_effect = [first_msg, second_msg]
 
         with patch(
-            "ccgram.handlers.tool_batch.edit_with_fallback",
+            "ccgram.handlers.tool_batch.edit_with_entities_outcome",
             new_callable=AsyncMock,
-            return_value=False,
+            return_value=EditOutcome.MISSING,
         ):
             await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
             await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu2"))
@@ -368,6 +428,200 @@ class TestProcessBatchTask:
         assert batch.telegram_msg_id == 101
         assert mock_send.await_count == 2
         assert mock_send.await_args.kwargs["disable_notification"] is True
+
+    async def test_transient_edit_failure_keeps_existing_bubble(
+        self, batch_env
+    ) -> None:
+        bot, mock_send, _ = batch_env
+        await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
+
+        with patch(
+            "ccgram.handlers.tool_batch.edit_with_entities_outcome",
+            new_callable=AsyncMock,
+            return_value=EditOutcome.TRANSIENT_FAILURE,
+        ):
+            await process_tool_event(
+                bot,
+                1,
+                _make_tool_use(tool_use_id="tu2", text="Read src/bar.py"),
+            )
+
+        batch = _active_batches[(1, 10)]
+        assert batch.telegram_msg_id == 100
+        assert mock_send.await_count == 1
+        assert len(batch.rendered_pages) == 1
+        assert "src/bar.py" not in batch.rendered_pages[0]
+
+    async def test_scheduled_transient_failure_retries_later(
+        self, batch_env, monkeypatch
+    ) -> None:
+        from ccgram.handlers import tool_batch
+
+        bot, mock_send, _ = batch_env
+        monkeypatch.setattr(tool_batch, "_agent_bubble_debounce_seconds", lambda: 0.01)
+        _active_batches[(1, 10)] = ToolBatch(
+            window_id="@0",
+            thread_id=10,
+            entries=[ToolBatchEntry("tu1", "Read src/foo.py", tool_name="Read")],
+            telegram_msg_id=100,
+            telegram_msg_ids=[100],
+            rendered_pages=[f"{EXP_START}Tools\nold{EXP_END}"],
+            segments=[
+                AgentBubbleSegment(
+                    "tools",
+                    entries=[
+                        ToolBatchEntry("tu1", "Read src/foo.py", tool_name="Read"),
+                    ],
+                )
+            ],
+        )
+
+        with patch(
+            "ccgram.handlers.tool_batch.edit_with_entities_outcome",
+            new_callable=AsyncMock,
+            return_value=EditOutcome.TRANSIENT_FAILURE,
+        ) as mock_edit:
+            await process_tool_event(
+                bot,
+                1,
+                _make_tool_use(tool_use_id="tu2", text="Read src/bar.py"),
+            )
+            await asyncio.sleep(0.05)
+
+        state = _delivery_states[(1, 10)]
+        assert mock_edit.await_count == 1
+        mock_send.assert_not_awaited()
+        assert state.retry_count == 1
+        assert state.dirty_version > state.flushed_version
+        assert state.scheduled_task is not None
+        assert not state.scheduled_task.done()
+        await shutdown_delivery_tasks()
+
+    async def test_newer_dirty_version_survives_older_flush_completion(
+        self, batch_env, monkeypatch
+    ) -> None:
+        from ccgram.handlers import tool_batch
+
+        bot, _, _ = batch_env
+        monkeypatch.setattr(tool_batch, "_agent_bubble_debounce_seconds", lambda: 10)
+        await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
+        batch = _active_batches[(1, 10)]
+        batch.telegram_msg_id = 100
+        batch.telegram_msg_ids = [100]
+        batch.rendered_pages = [f"{EXP_START}Tools\nold{EXP_END}"]
+
+        async def edit_and_mark_newer_dirty(*_args, **_kwargs) -> EditOutcome:
+            await process_tool_event(
+                bot,
+                1,
+                _make_tool_use(tool_use_id="tu2", text="Read src/bar.py"),
+            )
+            return EditOutcome.APPLIED
+
+        with patch(
+            "ccgram.handlers.tool_batch.edit_with_entities_outcome",
+            new=AsyncMock(side_effect=edit_and_mark_newer_dirty),
+        ):
+            delivered = await _flush_delivery_now(bot, 1, 10)
+
+        state = _delivery_states[(1, 10)]
+        assert delivered is True
+        assert state.flushed_version == 1
+        assert state.dirty_version == 2
+        assert "src/bar.py" not in batch.rendered_pages[0]
+        await shutdown_delivery_tasks()
+
+    async def test_stale_pages_not_deleted_when_new_render_fails(
+        self, batch_env
+    ) -> None:
+        bot, _, _ = batch_env
+        batch = ToolBatch(
+            window_id="@0",
+            thread_id=10,
+            entries=[ToolBatchEntry("tu1", "Read src/foo.py", tool_name="Read")],
+            telegram_msg_id=100,
+            telegram_msg_ids=[100, 101],
+            rendered_pages=["old page one", "old page two"],
+            segments=[
+                AgentBubbleSegment(
+                    "tools",
+                    entries=[
+                        ToolBatchEntry("tu1", "Read src/foo.py", tool_name="Read"),
+                    ],
+                )
+            ],
+        )
+        _active_batches[(1, 10)] = batch
+
+        with patch(
+            "ccgram.handlers.tool_batch.edit_with_entities_outcome",
+            new_callable=AsyncMock,
+            return_value=EditOutcome.TRANSIENT_FAILURE,
+        ):
+            await process_tool_event(
+                bot,
+                1,
+                _make_tool_use(tool_use_id="tu2", text="Read src/bar.py"),
+            )
+
+        bot.delete_message.assert_not_awaited()
+        assert batch.telegram_msg_ids == [100, 101]
+        assert batch.rendered_pages == ["old page one", "old page two"]
+
+    async def test_stale_pages_deleted_after_full_success(self, batch_env) -> None:
+        bot, _, _ = batch_env
+        batch = ToolBatch(
+            window_id="@0",
+            thread_id=10,
+            entries=[ToolBatchEntry("tu1", "Read src/foo.py", tool_name="Read")],
+            telegram_msg_id=100,
+            telegram_msg_ids=[100, 101],
+            rendered_pages=["old page one", "old page two"],
+            segments=[
+                AgentBubbleSegment(
+                    "tools",
+                    entries=[
+                        ToolBatchEntry("tu1", "Read src/foo.py", tool_name="Read"),
+                    ],
+                )
+            ],
+        )
+        _active_batches[(1, 10)] = batch
+
+        with patch(
+            "ccgram.handlers.tool_batch.edit_with_entities_outcome",
+            new_callable=AsyncMock,
+            return_value=EditOutcome.APPLIED,
+        ):
+            await process_tool_event(
+                bot,
+                1,
+                _make_tool_use(tool_use_id="tu2", text="Read src/bar.py"),
+            )
+
+        bot.delete_message.assert_awaited_once_with(chat_id=42, message_id=101)
+        assert batch.telegram_msg_ids == [100]
+        assert batch.rendered_pages != ["old page one", "old page two"]
+
+    async def test_final_answer_flushes_immediately_and_closes_batch(
+        self, batch_env, monkeypatch
+    ) -> None:
+        from ccgram.handlers import tool_batch
+
+        bot, mock_send, _ = batch_env
+        monkeypatch.setattr(tool_batch, "_agent_bubble_debounce_seconds", lambda: 10)
+        task = ContentTask(
+            window_id="@0",
+            parts=("final text",),
+            thread_id=10,
+            phase="final_answer",
+        )
+
+        await process_agent_message(bot, 1, task)
+
+        mock_send.assert_awaited_once()
+        assert (1, 10) not in _active_batches
+        assert (1, 10) not in _delivery_states
 
     async def test_persisted_batch_after_restart_edits_existing_message(
         self, batch_env
@@ -541,6 +795,9 @@ class TestFlushBatch:
         self, mock_send, mock_tr
     ) -> None:
         mock_tr.resolve_chat_id.return_value = 42
+        sent_msg = MagicMock()
+        sent_msg.message_id = 201
+        mock_send.return_value = sent_msg
         _active_batches[(1, 0)] = ToolBatch(
             window_id="@0",
             thread_id=0,
@@ -560,6 +817,9 @@ class TestFlushBatch:
         self, mock_send, mock_tr
     ) -> None:
         mock_tr.resolve_chat_id.return_value = 42
+        sent_msg = MagicMock()
+        sent_msg.message_id = 201
+        mock_send.return_value = sent_msg
         _active_batches[(1, 0)] = ToolBatch(
             window_id="@0",
             thread_id=0,
@@ -569,9 +829,9 @@ class TestFlushBatch:
 
         bot = AsyncMock()
         with patch(
-            "ccgram.handlers.tool_batch.edit_with_fallback",
+            "ccgram.handlers.tool_batch.edit_with_entities_outcome",
             new_callable=AsyncMock,
-            return_value=False,
+            return_value=EditOutcome.MISSING,
         ):
             await flush_batch(bot, 1, 0)
 

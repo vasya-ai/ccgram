@@ -5,11 +5,14 @@ from telegram import Message
 from telegram.error import BadRequest, RetryAfter, TelegramError
 
 from ccgram.handlers.message_sender import (
+    EditOutcome,
     MESSAGE_SEND_INTERVAL,
     _last_send_time,
     _send_with_fallback,
     edit_with_fallback,
+    edit_with_entities_outcome,
     rate_limit_send,
+    rate_limit_send_message_strict,
 )
 from ccgram.expandable_quote import EXPANDABLE_QUOTE_END as EXP_END
 from ccgram.expandable_quote import EXPANDABLE_QUOTE_START as EXP_START
@@ -209,6 +212,54 @@ class TestEditWithFallback:
         ]
         with pytest.raises(RetryAfter):
             await edit_with_fallback(bot, 123, 1, "hello")
+
+
+class TestStrictAgentBubbleDelivery:
+    async def test_strict_send_does_not_plain_fallback(self) -> None:
+        bot = AsyncMock()
+        bot.send_message.side_effect = TelegramError("entity fail")
+
+        result = await rate_limit_send_message_strict(bot, 123, "hello")
+
+        assert result is None
+        assert bot.send_message.call_count == 1
+        call_kwargs = bot.send_message.call_args.kwargs
+        assert "entities" in call_kwargs
+
+    async def test_strict_edit_does_not_plain_fallback(self) -> None:
+        bot = AsyncMock()
+        bot.edit_message_text.side_effect = TelegramError("entity fail")
+
+        result = await edit_with_entities_outcome(bot, 123, 1, "hello")
+
+        assert result is EditOutcome.TRANSIENT_FAILURE
+        assert bot.edit_message_text.call_count == 1
+        call_kwargs = bot.edit_message_text.call_args.kwargs
+        assert "entities" in call_kwargs
+
+    async def test_strict_edit_missing_message(self) -> None:
+        bot = AsyncMock()
+        bot.edit_message_text.side_effect = BadRequest("Message to edit not found")
+
+        result = await edit_with_entities_outcome(bot, 123, 1, "hello")
+
+        assert result is EditOutcome.MISSING
+
+    async def test_strict_edit_permanent_failure(self) -> None:
+        bot = AsyncMock()
+        bot.edit_message_text.side_effect = BadRequest("Message is too long")
+
+        result = await edit_with_entities_outcome(bot, 123, 1, "hello")
+
+        assert result is EditOutcome.PERMANENT_FAILURE
+
+    async def test_strict_edit_not_modified(self) -> None:
+        bot = AsyncMock()
+        bot.edit_message_text.side_effect = BadRequest("Message is not modified")
+
+        result = await edit_with_entities_outcome(bot, 123, 1, "hello")
+
+        assert result is EditOutcome.NOT_MODIFIED
 
 
 class TestFallbackNoSentinelLeak:
