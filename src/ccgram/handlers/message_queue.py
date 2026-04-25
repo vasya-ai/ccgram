@@ -274,7 +274,6 @@ async def _dispatch(
             await process_status_update(bot, user_id, collapsed_task)
             return 0
         case StatusClearTask() as cl:
-            await _flush_batch_for_task(user_id, cl, bot)
             await process_status_clear(bot, user_id, cl)
             return 0
         case _ as unreachable:

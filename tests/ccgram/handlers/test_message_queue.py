@@ -315,7 +315,7 @@ class TestDispatch:
         cl = _clear_task()
         extra = await _dispatch(bot, 1, cl, queue, lock)
         assert extra == 0
-        mock_flush.assert_awaited_once_with(1, cl, bot)
+        mock_flush.assert_not_awaited()
         mock_clear.assert_awaited_once_with(bot, 1, cl)
 
 
