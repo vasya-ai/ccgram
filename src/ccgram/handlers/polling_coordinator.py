@@ -67,6 +67,13 @@ async def status_poll_loop(bot: "Bot") -> None:
                         thread_id,
                         e,
                     )
+                except Exception:
+                    logger.exception(
+                        "Unexpected status update error for bound window",
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        window_id=wid,
+                    )
 
             await run_lifecycle_tasks(bot, all_windows)
 

@@ -253,6 +253,38 @@ class TestPerBindingError:
 
         assert call_order == ["@0", "@1", "@2"]
 
+    async def test_unexpected_error_does_not_abort_loop(self):
+        bot = AsyncMock(spec=Bot)
+        w0, w1, w2 = _make_window("@0"), _make_window("@1"), _make_window("@2")
+        bindings = [(1, 100, "@0"), (2, 200, "@1"), (3, 300, "@2")]
+
+        combined, ctx = _patch_loop_deps(bindings=bindings, windows=[w0, w1, w2])
+        call_order: list[str] = []
+
+        async def _tick_side_effect(
+            _bot: Bot, uid: int, tid: int, wid: str, _w: Any
+        ) -> None:
+            call_order.append(wid)
+            if wid == "@1":
+                raise NameError("boom")
+
+        with combined():
+            ctx.mocks["tick_window"].side_effect = _tick_side_effect
+
+            async def _stop_sleep(_delay: float) -> None:
+                raise asyncio.CancelledError
+
+            with (
+                patch(
+                    "ccgram.handlers.polling_coordinator.asyncio.sleep",
+                    side_effect=_stop_sleep,
+                ),
+                contextlib.suppress(asyncio.CancelledError),
+            ):
+                await status_poll_loop(bot)
+
+        assert call_order == ["@0", "@1", "@2"]
+
 
 class TestBackoffConstants:
     def test_backoff_bounds(self):
