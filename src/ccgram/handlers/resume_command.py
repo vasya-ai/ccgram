@@ -13,8 +13,10 @@ Key functions:
 """
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import structlog
 from telegram import (
@@ -44,21 +46,34 @@ from .user_state import RESUME_SESSIONS
 logger = structlog.get_logger()
 
 _SESSIONS_PER_PAGE = 6
+_CODEX_METADATA_SCAN_LINES = 50
+_SUMMARY_MAX_CHARS = 80
 
 _IndexParseError = (json.JSONDecodeError, OSError)
 
 
 @dataclass
 class ResumeEntry:
-    """A resumable session discovered from project directories."""
+    """A resumable session discovered from provider session storage."""
 
     session_id: str
     summary: str
     cwd: str
+    provider_name: str = "claude"
 
 
-def scan_all_sessions() -> list[ResumeEntry]:
-    """Scan project directories for resumable sessions.
+def scan_all_sessions(provider_name: str | None = None) -> list[ResumeEntry]:
+    """Scan provider-specific storage for resumable sessions."""
+    provider = provider_name or "claude"
+    if provider == "claude":
+        return _scan_claude_sessions()
+    if provider == "codex":
+        return _scan_codex_sessions()
+    return []
+
+
+def _scan_claude_sessions() -> list[ResumeEntry]:
+    """Scan Claude project directories for resumable sessions.
 
     Supports both legacy sessions-index.json and bare JSONL files
     (Claude Code >= Feb 2026 no longer writes index files).
@@ -152,6 +167,140 @@ def _scan_bare_jsonl(
         candidates.append(
             (mtime, ResumeEntry(session_id, summary or session_id[:12], cwd))
         )
+
+
+def _scan_codex_sessions() -> list[ResumeEntry]:
+    """Scan Codex CLI session JSONL files for resumable sessions."""
+    sessions_dir = Path.home() / ".codex" / "sessions"
+    if not sessions_dir.is_dir():
+        return []
+
+    candidates: list[tuple[float, ResumeEntry]] = []
+    seen_ids: set[str] = set()
+    try:
+        jsonl_files = list(sessions_dir.rglob("*.jsonl"))
+    except OSError:
+        return []
+
+    for jsonl_file in jsonl_files:
+        metadata = _read_codex_resume_metadata(jsonl_file)
+        if metadata is None:
+            continue
+        session_id, cwd, summary = metadata
+        if session_id in seen_ids:
+            continue
+        try:
+            mtime = jsonl_file.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        seen_ids.add(session_id)
+        candidates.append(
+            (
+                mtime,
+                ResumeEntry(session_id, summary or session_id[:12], cwd, "codex"),
+            )
+        )
+
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    return [entry for _, entry in candidates]
+
+
+def _read_codex_resume_metadata(jsonl_file: Path) -> tuple[str, str, str] | None:
+    """Read Codex session id, cwd, and first user prompt from a JSONL file."""
+    session_id = ""
+    cwd = ""
+    summary = ""
+    for data in _iter_jsonl_dicts(jsonl_file, _CODEX_METADATA_SCAN_LINES):
+        payload = data.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        entry_type = data.get("type", "")
+        if entry_type == "session_meta":
+            if _is_codex_subagent_source(payload.get("source")):
+                return None
+            session_id = _first_text(payload.get("id"), session_id)
+            cwd = _first_text(payload.get("cwd"), cwd)
+        elif entry_type == "turn_context":
+            cwd = _first_text(payload.get("cwd"), cwd)
+        if not summary:
+            summary = _extract_codex_user_summary(entry_type, payload)
+        if session_id and cwd and summary:
+            break
+
+    if not session_id or not cwd:
+        return None
+    return session_id, cwd, summary
+
+
+def _iter_jsonl_dicts(jsonl_file: Path, max_lines: int) -> Iterator[dict[str, Any]]:
+    try:
+        with open(jsonl_file, encoding="utf-8") as f:
+            for line_index, line in enumerate(f):
+                if line_index >= max_lines:
+                    break
+                parsed = _parse_jsonl_dict(line)
+                if parsed is not None:
+                    yield parsed
+    except OSError:
+        return
+
+
+def _parse_jsonl_dict(line: str) -> dict[str, Any] | None:
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _first_text(value: Any, current: str) -> str:
+    if current:
+        return current
+    return value if isinstance(value, str) and value else ""
+
+
+def _is_codex_subagent_source(source: Any) -> bool:
+    return isinstance(source, dict) and "subagent" in source
+
+
+def _extract_codex_user_summary(entry_type: str, payload: dict[str, Any]) -> str:
+    if entry_type not in ("response_item", "input_item"):
+        return ""
+    if payload.get("role") != "user":
+        return ""
+    text = _extract_codex_content_text(payload.get("content"))
+    if _is_codex_injected_context(text):
+        return ""
+    return text[:_SUMMARY_MAX_CHARS]
+
+
+def _is_codex_injected_context(text: str) -> bool:
+    return text.startswith(
+        (
+            "<permissions",
+            "<environment_context",
+            "# AGENTS.md instructions",
+        )
+    )
+
+
+def _extract_codex_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") in ("input_text", "output_text", "text"):
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "".join(parts)
 
 
 def _build_resume_keyboard(
@@ -250,13 +399,19 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    sessions = scan_all_sessions()
+    provider_name = provider.capabilities.name
+    sessions = scan_all_sessions(provider_name)
     if not sessions:
         await safe_reply(update.message, "\u274c No past sessions found.")
         return
 
     session_dicts = [
-        {"session_id": s.session_id, "summary": s.summary, "cwd": s.cwd}
+        {
+            "session_id": s.session_id,
+            "summary": s.summary,
+            "cwd": s.cwd,
+            "provider_name": s.provider_name,
+        }
         for s in sessions
     ]
     if context.user_data is not None:
@@ -291,6 +446,7 @@ async def _create_resume_window(
     thread_id: int,
     session_id: str,
     cwd: str,
+    provider_name: str | None = None,
 ) -> tuple[bool, str, str, str]:
     """Unbind old window, create a new one with resume args.
 
@@ -303,15 +459,16 @@ async def _create_resume_window(
 
         lifecycle_strategy.clear_dead_notification(user_id, thread_id)
 
-    if old_window_id:
-        old_view = session_manager.view_window(old_window_id)
+    old_view = session_manager.view_window(old_window_id) if old_window_id else None
+    approval_mode = old_view.approval_mode if old_view else "normal"
+    if provider_name:
+        provider = get_provider_for_window(old_window_id or "", provider_name=provider_name)
+    elif old_window_id:
         provider = get_provider_for_window(
             old_window_id, provider_name=old_view.provider_name if old_view else None
         )
-        approval_mode = old_view.approval_mode if old_view else "normal"
     else:
         provider = get_provider()
-        approval_mode = "normal"
     launch_args = provider.make_launch_args(resume_id=session_id)
     launch_command = resolve_launch_command(
         provider.capabilities.name, approval_mode=approval_mode
@@ -356,6 +513,7 @@ async def _handle_pick(
     picked = stored[idx]
     session_id = picked["session_id"]
     cwd = picked.get("cwd", "")
+    provider_name = picked.get("provider_name")
 
     if not cwd or not Path(cwd).is_dir():
         await safe_edit(query, "\u274c Project directory no longer exists.")
@@ -364,7 +522,7 @@ async def _handle_pick(
         return
 
     success, message, created_wname, created_wid = await _create_resume_window(
-        user_id, thread_id, session_id, cwd
+        user_id, thread_id, session_id, cwd, provider_name
     )
     if not success:
         await safe_edit(query, f"\u274c {message}")
