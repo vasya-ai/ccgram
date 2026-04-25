@@ -8,6 +8,8 @@ tool-use batching lives in ``tool_batch``.
 
 import asyncio
 import contextlib
+import re
+import time
 from typing import assert_never
 
 import structlog
@@ -44,11 +46,17 @@ from .tool_batch import (
 logger = structlog.get_logger()
 
 MERGE_MAX_LENGTH = 3800  # Leave room within Telegram's 4096 char message limit
+RECENT_FINAL_SEND_TTL_SECS = 60.0
+_MEMORY_CITATION_RE = re.compile(
+    r"\s*<oai-mem-citation>.*?</oai-mem-citation>\s*",
+    re.DOTALL,
+)
 
 # Per-user message queues and worker tasks
 _message_queues: dict[int, asyncio.Queue[MessageTask]] = {}
 _queue_workers: dict[int, asyncio.Task[None]] = {}
 _queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
+_recent_final_sends: dict[tuple[int, int, str, str, str, str], tuple[float, str]] = {}
 
 # Map (tool_use_id, user_id, thread_key) -> telegram message_id
 # for editing tool_use messages with results
@@ -106,9 +114,79 @@ def _can_merge_tasks(base: ContentTask, candidate: MessageTask) -> bool:
         return False
     if base.role != candidate.role or base.phase != candidate.phase:
         return False
+    if base.phase == "final_answer":
+        return False
     if base.content_type in ("tool_use", "tool_result"):
         return False
     return candidate.content_type not in ("tool_use", "tool_result")
+
+
+def _normalize_final_content(parts: tuple[str, ...]) -> str:
+    """Build a stable duplicate signature for final answers."""
+    text = "\n\n".join(parts)
+    text = _MEMORY_CITATION_RE.sub("", text)
+    return "\n".join(line.rstrip() for line in text.strip().splitlines())
+
+
+def _final_content_key(
+    user_id: int,
+    task: ContentTask,
+) -> tuple[int, int, str, str, str, str]:
+    """Key duplicate final answers by destination and message shape."""
+    return (
+        user_id,
+        thread_key(task.thread_id),
+        task.window_id,
+        task.role,
+        task.content_type,
+        task.phase or "",
+    )
+
+
+def _prune_recent_final_sends(now: float) -> None:
+    """Drop stale duplicate signatures."""
+    stale = [
+        key
+        for key, (sent_at, _) in _recent_final_sends.items()
+        if now - sent_at > RECENT_FINAL_SEND_TTL_SECS
+    ]
+    for key in stale:
+        _recent_final_sends.pop(key, None)
+
+
+def _is_recent_duplicate_final(user_id: int, task: ContentTask) -> bool:
+    """Return True when this final answer was just sent to the same topic."""
+    if not (
+        task.role == "assistant"
+        and task.content_type == "text"
+        and task.phase == "final_answer"
+    ):
+        return False
+
+    signature = _normalize_final_content(task.parts)
+    if not signature:
+        return False
+
+    now = time.monotonic()
+    _prune_recent_final_sends(now)
+    previous = _recent_final_sends.get(_final_content_key(user_id, task))
+    return previous is not None and previous[1] == signature
+
+
+def _remember_final_send(user_id: int, task: ContentTask) -> None:
+    """Remember a successfully delivered final answer for duplicate suppression."""
+    if not (
+        task.role == "assistant"
+        and task.content_type == "text"
+        and task.phase == "final_answer"
+    ):
+        return
+    signature = _normalize_final_content(task.parts)
+    if signature:
+        _recent_final_sends[_final_content_key(user_id, task)] = (
+            time.monotonic(),
+            signature,
+        )
 
 
 async def _merge_content_tasks(
@@ -229,7 +307,16 @@ async def _handle_content_task(
     merged_task, merge_count = await _merge_content_tasks(queue, task, lock)
     if merge_count > 0:
         logger.debug("Merged %d tasks for user %s", merge_count, user_id)
+    if _is_recent_duplicate_final(user_id, merged_task):
+        logger.debug(
+            "Suppressing duplicate final answer for user %s thread %s window %s",
+            user_id,
+            thread_key(merged_task.thread_id),
+            merged_task.window_id,
+        )
+        return merge_count
     await _process_content_task(bot, user_id, merged_task)
+    _remember_final_send(user_id, merged_task)
     return merge_count
 
 
@@ -446,6 +533,11 @@ def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> 
     ]
     for key in keys_to_remove:
         _tool_msg_ids.pop(key, None)
+    final_keys_to_remove = [
+        key for key in _recent_final_sends if key[0] == user_id and key[1] == tkey
+    ]
+    for key in final_keys_to_remove:
+        _recent_final_sends.pop(key, None)
 
 
 async def shutdown_workers() -> None:
@@ -457,5 +549,6 @@ async def shutdown_workers() -> None:
     _queue_workers.clear()
     _message_queues.clear()
     _queue_locks.clear()
+    _recent_final_sends.clear()
     clear_all_batches()
     logger.info("Message queue workers stopped")

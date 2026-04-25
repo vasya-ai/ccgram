@@ -14,6 +14,7 @@ Modern Codex ``response_item`` payloads use typed shapes:
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Any, cast
 
@@ -53,6 +54,53 @@ _TOOL_NAME_ALIASES: dict[str, str] = {
 
 # Minimum line count to trigger stats + expandable quote for tool results.
 _TOOL_RESULT_QUOTE_THRESHOLD = 3
+_MEMORY_CITATION_RE = re.compile(
+    r"\s*<oai-mem-citation>.*?</oai-mem-citation>\s*",
+    re.DOTALL,
+)
+_STATE_LAST_FINAL_RESPONSE_TEXT = "__ccgram_codex_last_final_response_text"
+
+
+def _normalize_final_text(text: str) -> str:
+    """Normalize final-answer variants for duplicate suppression."""
+    return _MEMORY_CITATION_RE.sub("", text).strip()
+
+
+def _collect_final_response_texts(entries: list[dict[str, Any]]) -> set[str]:
+    """Collect authoritative final response_item texts from the current batch."""
+    final_texts: set[str] = set()
+    for entry in entries:
+        if entry.get("type") != "response_item":
+            continue
+        payload = entry.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") != "message":
+            continue
+        if payload.get("role") != "assistant":
+            continue
+        if payload.get("phase") != "final_answer":
+            continue
+        text = _extract_text_blocks(payload.get("content", ""))
+        if text:
+            final_texts.add(_normalize_final_text(text))
+    return final_texts
+
+
+def _remember_final_response_text(
+    pending: dict[str, Any],
+    messages: list[AgentMessage],
+) -> None:
+    """Remember the last final answer so later task_complete events can be ignored."""
+    for message in messages:
+        if (
+            message.role == "assistant"
+            and message.content_type == "text"
+            and message.phase == "final_answer"
+        ):
+            pending[_STATE_LAST_FINAL_RESPONSE_TEXT] = _normalize_final_text(
+                message.text
+            )
 
 
 def _format_codex_tool_result(raw_tool_name: str, output_text: str) -> str:
@@ -438,6 +486,8 @@ def _parse_response_message(
 def _parse_event_message(
     payload: dict[str, Any],
     pending: dict[str, Any],
+    known_final_texts: set[str] | None = None,
+    last_final_response_text: str | None = None,
 ) -> tuple[list[AgentMessage], dict[str, Any]]:
     """Parse Codex event_msg payloads that carry assistant-visible text."""
     payload_type = payload.get("type", "")
@@ -445,13 +495,31 @@ def _parse_event_message(
         text = payload.get("message", "")
         if not isinstance(text, str) or not text:
             return [], pending
+        phase = payload.get("phase")
+        if phase == "final_answer":
+            # Codex also emits the same final answer as a response_item message.
+            # The response_item is the authoritative user-visible payload and can
+            # include richer suffixes such as memory citations.
+            return [], pending
         return (
-            [AgentMessage(text=text, role="assistant", content_type="text")],
+            [
+                AgentMessage(
+                    text=text,
+                    role="assistant",
+                    content_type="text",
+                    phase=phase if isinstance(phase, str) and phase else None,
+                )
+            ],
             pending,
         )
     if payload_type == "task_complete":
         text = payload.get("last_agent_message", "")
         if not isinstance(text, str) or not text:
+            return [], pending
+        normalized = _normalize_final_text(text)
+        if normalized in (known_final_texts or set()):
+            return [], pending
+        if last_final_response_text and normalized == last_final_response_text:
             return [], pending
         return (
             [
@@ -612,6 +680,7 @@ class CodexProvider(JsonlProvider):
         messages: list[AgentMessage] = []
         pending = dict(pending_tools)
         last_signature: tuple[str, str, str] | None = None
+        known_final_texts = _collect_final_response_texts(entries)
 
         for entry in entries:
             entry_type = entry.get("type", "")
@@ -621,13 +690,23 @@ class CodexProvider(JsonlProvider):
 
             if entry_type == "response_item":
                 parsed, pending = _parse_codex_response_item(payload, pending)
+                _remember_final_response_text(pending, parsed)
                 last_signature = _append_unique_messages(
                     messages, parsed, last_signature
                 )
                 continue
 
             if entry_type == "event_msg":
-                parsed, pending = _parse_event_message(payload, pending)
+                last_final = pending.get(_STATE_LAST_FINAL_RESPONSE_TEXT)
+                parsed, pending = _parse_event_message(
+                    payload,
+                    pending,
+                    known_final_texts=known_final_texts,
+                    last_final_response_text=last_final
+                    if isinstance(last_final, str)
+                    else None,
+                )
+                _remember_final_response_text(pending, parsed)
                 last_signature = _append_unique_messages(
                     messages, parsed, last_signature
                 )
@@ -635,6 +714,8 @@ class CodexProvider(JsonlProvider):
 
             if entry_type == "input_item":
                 parsed, pending = _parse_input_item(payload, pending)
+                if parsed:
+                    pending.pop(_STATE_LAST_FINAL_RESPONSE_TEXT, None)
                 last_signature = _append_unique_messages(
                     messages, parsed, last_signature
                 )

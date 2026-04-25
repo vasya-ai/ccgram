@@ -230,6 +230,49 @@ class TestCodexTranscriptParsing:
         assert messages[0].text == "finished"
         assert messages[0].phase == "final_answer"
 
+    def test_prefers_response_item_over_final_event_variants(self) -> None:
+        codex = CodexProvider()
+        response_text = (
+            "finished\n\n"
+            "<oai-mem-citation>\n"
+            "<citation_entries>\n"
+            "MEMORY.md:1-2|note=[test]\n"
+            "</citation_entries>\n"
+            "<rollout_ids>\n"
+            "</rollout_ids>\n"
+            "</oai-mem-citation>"
+        )
+        entries = [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "final_answer",
+                    "message": "finished",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": response_text}],
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "last_agent_message": "finished",
+                },
+            },
+        ]
+        messages, _ = codex.parse_transcript_entries(entries, {})
+        assert len(messages) == 1
+        assert messages[0].text == response_text
+        assert messages[0].phase == "final_answer"
+
     def test_tracks_function_call_pending(self) -> None:
         codex = CodexProvider()
         entries = [

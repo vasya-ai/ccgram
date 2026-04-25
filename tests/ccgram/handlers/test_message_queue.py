@@ -38,6 +38,15 @@ def lock():
     return asyncio.Lock()
 
 
+@pytest.fixture(autouse=True)
+def clear_recent_final_sends():
+    from ccgram.handlers.message_queue import _recent_final_sends
+
+    _recent_final_sends.clear()
+    yield
+    _recent_final_sends.clear()
+
+
 def _content_task(
     text: str = "hello",
     window_id: str = "@0",
@@ -151,6 +160,11 @@ class TestCanMergeTasks:
         b = _content_task("world", phase="final_answer")
         assert not _can_merge_tasks(a, b)
 
+    def test_final_answer_blocks_merge(self):
+        a = _content_task("hello", phase="final_answer")
+        b = _content_task("world", phase="final_answer")
+        assert not _can_merge_tasks(a, b)
+
 
 class TestMergeContentTasks:
     async def test_merges_consecutive_text_tasks(self, queue, lock):
@@ -246,6 +260,35 @@ class TestDispatch:
         assert extra == 0
         mock_flush.assert_awaited_once_with(bot, 1, ct)
         mock_process.assert_awaited_once()
+
+    @patch(
+        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
+    )
+    @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
+    @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=False)
+    async def test_duplicate_final_answer_is_suppressed(
+        self, mock_eligible, mock_flush, mock_process, bot, queue, lock
+    ):
+        rich = _content_task(
+            "done\n\n"
+            "<oai-mem-citation>\n"
+            "<citation_entries>\n"
+            "MEMORY.md:1-2|note=[test]\n"
+            "</citation_entries>\n"
+            "<rollout_ids>\n"
+            "</rollout_ids>\n"
+            "</oai-mem-citation>",
+            phase="final_answer",
+        )
+        duplicate = _content_task("done", phase="final_answer")
+
+        first_extra = await _dispatch(bot, 1, rich, queue, lock)
+        second_extra = await _dispatch(bot, 1, duplicate, queue, lock)
+
+        assert first_extra == 0
+        assert second_extra == 0
+        assert mock_flush.await_count == 2
+        mock_process.assert_awaited_once_with(bot, 1, rich)
 
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
