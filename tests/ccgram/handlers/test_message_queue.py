@@ -236,38 +236,40 @@ class TestDispatch:
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
+    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
-    @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=False)
     async def test_content_task_dispatch(
-        self, mock_eligible, mock_flush, mock_process, bot, queue, lock
+        self, mock_flush, mock_agent, mock_process, bot, queue, lock
     ):
         ct = _content_task("hello")
         extra = await _dispatch(bot, 1, ct, queue, lock)
         assert extra == 0
         mock_flush.assert_not_awaited()
-        mock_process.assert_awaited_once()
+        mock_agent.assert_awaited_once_with(bot, 1, ct)
+        mock_process.assert_not_awaited()
 
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
+    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
-    @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=False)
-    async def test_final_answer_flushes_active_batch(
-        self, mock_eligible, mock_flush, mock_process, bot, queue, lock
+    async def test_final_answer_finishes_agent_bubble(
+        self, mock_flush, mock_agent, mock_process, bot, queue, lock
     ):
         ct = _content_task("done", phase="final_answer")
         extra = await _dispatch(bot, 1, ct, queue, lock)
         assert extra == 0
-        mock_flush.assert_awaited_once_with(bot, 1, ct)
-        mock_process.assert_awaited_once()
+        mock_flush.assert_not_awaited()
+        mock_agent.assert_awaited_once_with(bot, 1, ct)
+        mock_process.assert_not_awaited()
 
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
+    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
-    @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=False)
     async def test_duplicate_final_answer_is_suppressed(
-        self, mock_eligible, mock_flush, mock_process, bot, queue, lock
+        self, mock_flush, mock_agent, mock_process, bot, queue, lock
     ):
         rich = _content_task(
             "done\n\n"
@@ -287,16 +289,17 @@ class TestDispatch:
 
         assert first_extra == 0
         assert second_extra == 0
-        assert mock_flush.await_count == 2
-        mock_process.assert_awaited_once_with(bot, 1, rich)
+        mock_flush.assert_not_awaited()
+        mock_agent.assert_awaited_once_with(bot, 1, rich)
+        mock_process.assert_not_awaited()
 
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
+    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
-    @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=False)
     async def test_truncated_final_prefix_is_suppressed(
-        self, mock_eligible, mock_flush, mock_process, bot, queue, lock
+        self, mock_flush, mock_agent, mock_process, bot, queue, lock
     ):
         full = _content_task("done\n\nmore details", phase="final_answer")
         truncated = _content_task("done", phase="final_answer")
@@ -304,30 +307,29 @@ class TestDispatch:
         await _dispatch(bot, 1, full, queue, lock)
         await _dispatch(bot, 1, truncated, queue, lock)
 
-        assert mock_flush.await_count == 2
-        mock_process.assert_awaited_once_with(bot, 1, full)
+        mock_flush.assert_not_awaited()
+        mock_agent.assert_awaited_once_with(bot, 1, full)
+        mock_process.assert_not_awaited()
 
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
-    @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=False)
     async def test_user_message_flushes_active_batch(
-        self, mock_eligible, mock_flush, mock_process, bot, queue, lock
+        self, mock_flush, mock_process, bot, queue, lock
     ):
         ct = _content_task("prompt", role="user")
         extra = await _dispatch(bot, 1, ct, queue, lock)
         assert extra == 0
         mock_flush.assert_awaited_once_with(bot, 1, ct)
-        mock_process.assert_awaited_once()
+        mock_process.assert_not_awaited()
 
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
     @patch("ccgram.handlers.message_queue.process_tool_event", new_callable=AsyncMock)
-    @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=True)
-    async def test_content_task_batch_eligible(
-        self, mock_eligible, mock_tool_event, mock_process, bot, queue, lock
+    async def test_tool_content_routes_to_agent_bubble(
+        self, mock_tool_event, mock_process, bot, queue, lock
     ):
         ct = _content_task("tool", content_type="tool_use")
         mock_tool_event.return_value = None
@@ -339,16 +341,17 @@ class TestDispatch:
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
+    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
     @patch("ccgram.handlers.message_queue.process_tool_event", new_callable=AsyncMock)
-    @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=True)
-    async def test_content_task_batch_with_followup(
-        self, mock_eligible, mock_tool_event, mock_process, bot, queue, lock
+    async def test_tool_content_with_followup_routes_to_agent_bubble(
+        self, mock_tool_event, mock_agent, mock_process, bot, queue, lock
     ):
         ct = _content_task("tool", content_type="tool_use")
         followup = _content_task("overflow")
         mock_tool_event.return_value = followup
         await _dispatch(bot, 1, ct, queue, lock)
-        mock_process.assert_awaited_once_with(bot, 1, followup)
+        mock_agent.assert_awaited_once_with(bot, 1, followup)
+        mock_process.assert_not_awaited()
 
     @patch(
         "ccgram.handlers.message_queue.process_status_update", new_callable=AsyncMock

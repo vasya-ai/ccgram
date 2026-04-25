@@ -1,12 +1,12 @@
 """Window state storage — per-window mode and session metadata.
 
 Owns the WindowState dataclass and all window-scoped mode settings
-(approval, batch, notification). Extracted from SessionManager so that
+(approval, notification). Extracted from SessionManager so that
 providers, handlers, and tests can import window state without pulling in
 the full session management stack.
 
 Key class: WindowStateStore (singleton instantiated as ``window_store``).
-Key types: WindowState, APPROVAL_MODES, BATCH_MODES, NOTIFICATION_MODES.
+Key types: WindowState, APPROVAL_MODES, NOTIFICATION_MODES.
 """
 
 from __future__ import annotations
@@ -24,9 +24,6 @@ APPROVAL_MODES: frozenset[str] = frozenset({"normal", "yolo"})
 DEFAULT_APPROVAL_MODE = "normal"
 YOLO_APPROVAL_MODE = "yolo"
 
-BATCH_MODES: frozenset[str] = frozenset({"batched", "verbose"})
-DEFAULT_BATCH_MODE = "batched"
-
 NOTIFICATION_MODES: tuple[str, ...] = ("all", "errors_only", "muted")
 
 
@@ -42,7 +39,6 @@ class WindowState:
         notification_mode: "all" | "errors_only" | "muted"
         provider_name: Name of the agent provider for this window
         approval_mode: "normal" | "yolo"
-        batch_mode: "batched" | "verbose"
         external: True for windows owned by external tools (emdash) — never killed by ccgram
     """
 
@@ -53,7 +49,6 @@ class WindowState:
     notification_mode: str = "all"
     provider_name: str = ""
     approval_mode: str = DEFAULT_APPROVAL_MODE
-    batch_mode: str = DEFAULT_BATCH_MODE
     external: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -71,8 +66,6 @@ class WindowState:
             d["provider_name"] = self.provider_name
         if self.approval_mode != DEFAULT_APPROVAL_MODE:
             d["approval_mode"] = self.approval_mode
-        if self.batch_mode != DEFAULT_BATCH_MODE:
-            d["batch_mode"] = self.batch_mode
         if self.external:
             d["external"] = True
         return d
@@ -87,7 +80,6 @@ class WindowState:
             notification_mode=data.get("notification_mode", "all"),
             provider_name=data.get("provider_name", ""),
             approval_mode=data.get("approval_mode", DEFAULT_APPROVAL_MODE),
-            batch_mode=data.get("batch_mode", DEFAULT_BATCH_MODE),
             external=data.get("external", False),
         )
 
@@ -97,7 +89,7 @@ class WindowStateStore:
     """Per-window mode and session metadata store.
 
     Owns the window_states dict and all methods for reading/writing
-    per-window settings: notification mode, approval mode, batch mode,
+    per-window settings: notification mode, approval mode,
     provider name, and session/cwd association.
 
     Persistence is delegated: the ``_schedule_save`` callback (set by
@@ -281,32 +273,6 @@ class WindowStateStore:
         state = self.get_window_state(window_id)
         state.approval_mode = normalized
         self._schedule_save()
-
-    # ------------------------------------------------------------------
-    # Batch mode
-    # ------------------------------------------------------------------
-
-    def get_batch_mode(self, window_id: str) -> str:
-        """Get batch mode for a window (default: 'batched')."""
-        state = self.window_states.get(window_id)
-        mode = state.batch_mode if state else DEFAULT_BATCH_MODE
-        return mode if mode in BATCH_MODES else DEFAULT_BATCH_MODE
-
-    def set_batch_mode(self, window_id: str, mode: str) -> None:
-        """Set batch mode for a window."""
-        if mode not in BATCH_MODES:
-            raise ValueError(f"Invalid batch mode: {mode!r}")
-        state = self.get_window_state(window_id)
-        if state.batch_mode != mode:
-            state.batch_mode = mode
-            self._schedule_save()
-
-    def cycle_batch_mode(self, window_id: str) -> str:
-        """Toggle batch mode: batched ↔ verbose. Returns new mode."""
-        current = self.get_batch_mode(window_id)
-        new_mode = "verbose" if current == "batched" else "batched"
-        self.set_batch_mode(window_id, new_mode)
-        return new_mode
 
     # ------------------------------------------------------------------
     # Stale state pruning

@@ -32,9 +32,7 @@ from .window_resolver import EMDASH_SESSION_PREFIX, is_foreign_window, is_window
 from .window_view import WindowView
 from .window_state_store import (
     APPROVAL_MODES,
-    BATCH_MODES,
     DEFAULT_APPROVAL_MODE,
-    DEFAULT_BATCH_MODE,
     NOTIFICATION_MODES,
     WindowState,
     window_store,
@@ -556,7 +554,6 @@ class SessionManager:
             provider_name=ws.provider_name,
             approval_mode=ws.approval_mode,
             notification_mode=ws.notification_mode,
-            batch_mode=ws.batch_mode,
             transcript_path=Path(ws.transcript_path) if ws.transcript_path else None,
             window_name=ws.window_name,
             session_id=ws.session_id,
@@ -651,30 +648,6 @@ class SessionManager:
         idx = modes.index(current) if current in modes else 0
         new_mode = modes[(idx + 1) % len(modes)]
         self.set_notification_mode(window_id, new_mode)
-        return new_mode
-
-    # --- Batch mode ---
-
-    def get_batch_mode(self, window_id: str) -> str:
-        """Get batch mode for a window (default: 'batched')."""
-        state = self.window_states.get(window_id)
-        mode = state.batch_mode if state else DEFAULT_BATCH_MODE
-        return mode if mode in BATCH_MODES else DEFAULT_BATCH_MODE
-
-    def set_batch_mode(self, window_id: str, mode: str) -> None:
-        """Set batch mode for a window."""
-        if mode not in BATCH_MODES:
-            raise ValueError(f"Invalid batch mode: {mode!r}")
-        state = window_store.get_window_state(window_id)
-        if state.batch_mode != mode:
-            state.batch_mode = mode
-            self._save_state()
-
-    def cycle_batch_mode(self, window_id: str) -> str:
-        """Toggle batch mode: batched ↔ verbose. Returns new mode."""
-        current = self.get_batch_mode(window_id)
-        new_mode = "verbose" if current == "batched" else "batched"
-        self.set_batch_mode(window_id, new_mode)
         return new_mode
 
 

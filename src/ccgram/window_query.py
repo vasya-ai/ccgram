@@ -17,9 +17,7 @@ from pathlib import Path
 
 from .window_state_store import (
     APPROVAL_MODES,
-    BATCH_MODES,
     DEFAULT_APPROVAL_MODE,
-    DEFAULT_BATCH_MODE,
     window_store,
 )
 from .window_view import WindowView
@@ -36,7 +34,6 @@ def view_window(window_id: str) -> WindowView | None:
         provider_name=ws.provider_name,
         approval_mode=ws.approval_mode,
         notification_mode=ws.notification_mode,
-        batch_mode=ws.batch_mode,
         transcript_path=Path(ws.transcript_path) if ws.transcript_path else None,
         window_name=ws.window_name,
         session_id=ws.session_id,
@@ -61,13 +58,6 @@ def get_notification_mode(window_id: str) -> str:
     """Get notification mode for a window (default: 'all')."""
     state = window_store.window_states.get(window_id)
     return state.notification_mode if state else "all"
-
-
-def get_batch_mode(window_id: str) -> str:
-    """Get batch mode for a window (default: 'batched')."""
-    state = window_store.window_states.get(window_id)
-    mode = state.batch_mode if state else DEFAULT_BATCH_MODE
-    return mode if mode in BATCH_MODES else DEFAULT_BATCH_MODE
 
 
 def get_session_id_for_window(window_id: str) -> str | None:

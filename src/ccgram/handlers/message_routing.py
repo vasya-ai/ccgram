@@ -34,6 +34,17 @@ _ERROR_KEYWORDS_RE = re.compile(
 _MIN_THINKING_LENGTH = 20
 
 
+async def _update_user_window_offset(user_id: int, window_id: str) -> None:
+    session = await session_query.resolve_session_for_window(window_id)
+    if not (session and session.file_path):
+        return
+    try:
+        file_size = Path(session.file_path).stat().st_size
+    except OSError:
+        return
+    user_preferences.update_user_window_offset(user_id, window_id, file_size)
+
+
 async def handle_new_message(msg: NewMessage, bot: Bot) -> None:  # noqa: C901, PLR0912
     """Handle a new assistant message — enqueue for sequential processing.
 
@@ -59,6 +70,24 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:  # noqa: C901, 
         structlog.contextvars.bind_contextvars(
             window_id=window_id, session_id=msg.session_id
         )
+
+        if msg.role == "user":
+            if msg.is_complete:
+                await enqueue_content_message(
+                    bot=bot,
+                    user_id=user_id,
+                    window_id=window_id,
+                    parts=[msg.text],
+                    tool_use_id=msg.tool_use_id,
+                    tool_name=msg.tool_name,
+                    content_type="text",
+                    thread_id=thread_id,
+                    role=msg.role,
+                    phase=msg.phase,
+                )
+                await _update_user_window_offset(user_id, window_id)
+            continue
+
         notif_mode = window_query.get_notification_mode(window_id)
         is_tool_flow = msg.tool_name in INTERACTIVE_TOOL_NAMES or msg.content_type in (
             "tool_use",
@@ -87,15 +116,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:  # noqa: C901, 
             await asyncio.sleep(0.3)
             handled = await handle_interactive_ui(bot, user_id, window_id, thread_id)
             if handled:
-                session = await session_query.resolve_session_for_window(window_id)
-                if session and session.file_path:
-                    try:
-                        file_size = Path(session.file_path).stat().st_size
-                        user_preferences.update_user_window_offset(
-                            user_id, window_id, file_size
-                        )
-                    except OSError:
-                        pass
+                await _update_user_window_offset(user_id, window_id)
                 continue
             else:
                 clear_interactive_mode(user_id, thread_id)
@@ -103,12 +124,15 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:  # noqa: C901, 
         if get_interactive_msg_id(user_id, thread_id):
             await clear_interactive_msg(user_id, bot, thread_id)
 
-        parts = build_response_parts(
-            msg.text,
-            msg.is_complete,
-            msg.content_type,
-            msg.role,
-        )
+        if msg.content_type == "thinking":
+            parts = build_response_parts(
+                msg.text,
+                msg.is_complete,
+                msg.content_type,
+                msg.role,
+            )
+        else:
+            parts = [msg.text.strip()]
 
         if msg.is_complete:
             await enqueue_content_message(
@@ -124,12 +148,4 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:  # noqa: C901, 
                 phase=msg.phase,
             )
 
-            session = await session_query.resolve_session_for_window(window_id)
-            if session and session.file_path:
-                try:
-                    file_size = Path(session.file_path).stat().st_size
-                    user_preferences.update_user_window_offset(
-                        user_id, window_id, file_size
-                    )
-                except OSError:
-                    pass
+            await _update_user_window_offset(user_id, window_id)

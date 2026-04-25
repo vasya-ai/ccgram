@@ -8,8 +8,8 @@ from telegram import MessageEntity
 from ccgram.entity_formatting import convert_to_entities
 from ccgram.expandable_quote import EXPANDABLE_QUOTE_END as EXP_END
 from ccgram.expandable_quote import EXPANDABLE_QUOTE_START as EXP_START
-from ccgram.handlers.message_task import ContentTask
 from ccgram.handlers.tool_batch import (
+    AgentBubbleSegment,
     TELEGRAM_TEXT_LIMIT,
     TOOL_BUBBLE_TITLE,
     ToolBatch,
@@ -18,8 +18,8 @@ from ccgram.handlers.tool_batch import (
     _extract_task_create_title,
     _status_from_result_text,
     flush_if_active,
+    format_agent_pages,
     format_batch_message,
-    is_batch_eligible,
     process_tool_event,
 )
 
@@ -99,7 +99,30 @@ class TestFormatBatchMessage:
             assert f'file{i}.py' in result
         assert len(result) <= TELEGRAM_TEXT_LIMIT
 
-    def test_above_limit_hides_oldest_tools(self) -> None:
+    def test_agent_pages_preserve_text_tool_text_tool_order(self) -> None:
+        pages = format_agent_pages(
+            [
+                AgentBubbleSegment("text", text="First note"),
+                AgentBubbleSegment(
+                    "tools",
+                    entries=[ToolBatchEntry("t1", "Bash ls", tool_name="Bash")],
+                ),
+                AgentBubbleSegment("text", text="Second note"),
+                AgentBubbleSegment(
+                    "tools",
+                    entries=[ToolBatchEntry("t2", "Read src/app.py", tool_name="Read")],
+                ),
+            ]
+        )
+
+        assert len(pages) == 1
+        page = pages[0]
+        assert page.index("First note") < page.index("Bash")
+        assert page.index("Bash") < page.index("Second note")
+        assert page.index("Second note") < page.index("Read")
+        assert page.count(EXP_START) == 2
+
+    def test_above_limit_paginates_oldest_first(self) -> None:
         entries = [
             ToolBatchEntry(
                 f"t{i}",
@@ -109,12 +132,14 @@ class TestFormatBatchMessage:
             for i in range(80)
         ]
 
-        result = format_batch_message(entries)
+        pages = format_agent_pages([AgentBubbleSegment("tools", entries=entries)])
 
-        assert len(result) <= TELEGRAM_TEXT_LIMIT
-        assert "earlier tools" in result
-        assert "command-79" in result
-        assert "command-0" not in result
+        assert len(pages) > 1
+        assert all(len(page) <= TELEGRAM_TEXT_LIMIT for page in pages)
+        assert "earlier tools" not in "\n".join(pages)
+        assert "command-0" in pages[0]
+        assert "command-79" in pages[-1]
+        assert pages[0].endswith(f"[1/{len(pages)}]")
 
     def test_pathological_single_entry_is_truncated_not_split(self) -> None:
         entry = ToolBatchEntry("t1", "Bash short", tool_name="Bash")
@@ -146,60 +171,6 @@ class TestExtractTaskCreateTitle:
     def test_empty_text(self) -> None:
         entry = ToolBatchEntry(tool_use_id="t1", tool_use_text="")
         assert _extract_task_create_title(entry) == ""
-
-
-class TestIsBatchEligible:
-    def _make_task(
-        self, content_type: str = "text", window_id: str = "@0"
-    ) -> ContentTask:
-        return ContentTask(
-            window_id=window_id,
-            parts=("hello",),
-            content_type=content_type,  # type: ignore[arg-type]
-        )
-
-    @pytest.mark.parametrize("content_type", ["tool_use", "tool_result"])
-    def test_tool_types_eligible_with_batched_window(
-        self, content_type: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from ccgram.handlers import tool_batch
-
-        monkeypatch.setattr(tool_batch, "get_batch_mode", lambda _wid: "batched")
-        task = self._make_task(content_type=content_type)
-        assert is_batch_eligible(task) is True
-
-    @pytest.mark.parametrize("content_type", ["text", "thinking", "status"])
-    def test_non_tool_types_not_eligible(
-        self, content_type: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from ccgram.handlers import tool_batch
-
-        monkeypatch.setattr(tool_batch, "get_batch_mode", lambda _wid: "batched")
-        task = self._make_task(content_type=content_type)
-        assert is_batch_eligible(task) is False
-
-    def test_not_eligible_when_batch_mode_verbose(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from ccgram.handlers import tool_batch
-
-        monkeypatch.setattr(tool_batch, "get_batch_mode", lambda _wid: "verbose")
-        task = self._make_task(content_type="tool_use")
-        assert is_batch_eligible(task) is False
-
-    def test_window_id_derived_from_task(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from ccgram.handlers import tool_batch
-
-        captured: list[str] = []
-
-        def capture_get_batch_mode(wid: str) -> str:
-            captured.append(wid)
-            return "batched"
-
-        monkeypatch.setattr(tool_batch, "get_batch_mode", capture_get_batch_mode)
-        task = self._make_task(content_type="tool_use", window_id="@7")
-        is_batch_eligible(task)
-        assert captured == ["@7"]
 
 
 class TestBatchResultStatus:

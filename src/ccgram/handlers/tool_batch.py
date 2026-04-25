@@ -1,21 +1,22 @@
-"""Tool-use batching — one rotating Telegram tool bubble.
+"""Agent turn bubbles — ordered Telegram rendering for assistant output.
 
-Accumulates consecutive tool_use / tool_result messages into one compact
-Telegram message that is edited in place as tools arrive and complete.  The
-full in-memory entry list is retained for the active turn; rendering rotates to
-the newest entries that fit Telegram's text limit. Active batches are persisted
-so a service restart can continue editing the same Telegram message.
+Accumulates assistant text plus tool_use / tool_result events into one ordered
+Telegram bubble per agent turn. Tool calls render as expandable quote sections
+between the assistant messages that surround them. When the rendered turn grows
+past Telegram's text limit, pages are appended in chronological order instead
+of rotating older tool rows out.
 
 Key components:
-  - ToolBatchEntry / ToolBatch: batch state dataclasses
+  - ToolBatchEntry / AgentBubbleSegment / ToolBatch: turn state dataclasses
   - process_tool_event: state-machine entry point (add tool_use or tool_result)
+  - process_agent_message: append assistant text to the active turn bubble
   - flush_batch: finalize and send the last edit for a batch
-  - is_batch_eligible: predicate combining task eligibility and window mode
-  - format_batch_message: render entries as a compact expandable quote
+  - format_batch_message: render tool-only entries as ordered paginated content
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -26,10 +27,11 @@ from typing import Any, Literal
 
 import structlog
 from telegram import Bot
+from telegram.error import TelegramError
 
 from ..expandable_quote import EXPANDABLE_QUOTE_END, EXPANDABLE_QUOTE_START
+from ..telegram_sender import split_message
 from ..utils import atomic_write_json, ccgram_dir
-from ..window_query import get_batch_mode
 from ..thread_router import thread_router
 from ..topic_state_registry import topic_state
 from .message_sender import edit_with_fallback, rate_limit_send_message, send_kwargs
@@ -46,6 +48,7 @@ _PERSISTED_BATCH_STATE_VERSION = 1
 _PERSISTED_BATCH_MAX_AGE_SECONDS = 6 * 60 * 60
 
 ToolStatus = Literal["pending", "success", "error"]
+AgentBubbleSegmentKind = Literal["text", "tools"]
 
 
 @dataclass
@@ -77,13 +80,25 @@ class ToolBatchEntry:
 
 
 @dataclass
+class AgentBubbleSegment:
+    """One ordered section in an agent turn bubble."""
+
+    kind: AgentBubbleSegmentKind
+    text: str = ""
+    entries: list[ToolBatchEntry] = field(default_factory=list)
+
+
+@dataclass
 class ToolBatch:
-    """Accumulator for consecutive tool calls to batch into one Telegram message."""
+    """Accumulator for one agent turn rendered into Telegram message pages."""
 
     window_id: str
     thread_id: int  # thread_id_or_0
     entries: list[ToolBatchEntry] = field(default_factory=list)
     telegram_msg_id: int | None = None
+    telegram_msg_ids: list[int] = field(default_factory=list)
+    segments: list[AgentBubbleSegment] = field(default_factory=list)
+    rendered_pages: list[str] = field(default_factory=list)
     total_length: int = 0  # Legacy metric; no longer used as an overflow trigger.
 
 
@@ -142,19 +157,6 @@ _TOOL_ICONS = {
 
 
 # ---------------------------------------------------------------------------
-# Public predicates
-# ---------------------------------------------------------------------------
-
-
-def is_batch_eligible(task: ContentTask) -> bool:
-    """Check if a task should go through the batching pipeline."""
-    return (
-        task.content_type in ("tool_use", "tool_result")
-        and get_batch_mode(task.window_id) == "batched"
-    )
-
-
-# ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
 
@@ -164,11 +166,32 @@ def format_batch_message(
     subagent_label: str | None = None,
     provider_label: str | None = None,
 ) -> str:
-    """Render the active tool list as a compact expandable Telegram quote."""
+    """Render tool entries in chronological order.
+
+    Kept for compatibility with older tests/callers. New delivery uses
+    ``format_agent_pages`` so long turns can span multiple Telegram messages.
+    """
     del subagent_label  # Legacy signature; task grouping text is intentionally gone.
+    pages = format_agent_pages(
+        [AgentBubbleSegment("tools", entries=list(entries))],
+        provider_label=provider_label,
+    )
+    return pages[0] if pages else _render_tool_bubble([], _tool_bubble_title(provider_label))
+
+
+def format_agent_pages(
+    segments: list[AgentBubbleSegment],
+    provider_label: str | None = None,
+) -> list[str]:
+    """Render ordered assistant/tool segments into Telegram-sized pages."""
+    builder = _AgentPageBuilder()
     title = _tool_bubble_title(provider_label)
-    lines = [_format_batch_entry(entry) for entry in entries]
-    return _rotate_tool_lines(lines, title)
+    for segment in segments:
+        if segment.kind == "text":
+            builder.add_text(segment.text)
+        elif segment.kind == "tools":
+            builder.add_tool_entries(segment.entries, title)
+    return _with_page_footers(builder.finish())
 
 
 def _batch_result_prefix(result_text: str) -> str:
@@ -188,32 +211,10 @@ def _format_batch_entry(entry: ToolBatchEntry) -> str:
     return f'{icon} {tool_name}: "{entry.summary}" {glyph}'
 
 
-def _rotate_tool_lines(lines: list[str], title: str) -> str:
-    """Render the newest suffix of lines that fits Telegram's text limit."""
-    if not lines:
-        return _render_tool_bubble([], title, hidden_count=0)
-
-    visible: list[str] = []
-    for index in range(len(lines) - 1, -1, -1):
-        candidate = [lines[index], *visible]
-        hidden_count = index
-        if _tool_bubble_fits(candidate, title, hidden_count):
-            visible = candidate
-            continue
-        break
-
-    if not visible:
-        hidden_count = len(lines) - 1
-        visible = [_truncate_line_to_fit(lines[-1], title, hidden_count)]
-
-    hidden_count = len(lines) - len(visible)
-    return _render_tool_bubble(visible, title, hidden_count)
-
-
 def _render_tool_bubble(
     visible_lines: list[str],
     title: str,
-    hidden_count: int,
+    hidden_count: int = 0,
 ) -> str:
     body = _render_tool_bubble_body(visible_lines, title, hidden_count)
     return f"{EXPANDABLE_QUOTE_START}{body}{EXPANDABLE_QUOTE_END}"
@@ -229,6 +230,101 @@ def _render_tool_bubble_body(
         body_lines.append(f"{_TOOL_LINE_ELLIPSIS} {hidden_count} earlier tools {_TOOL_LINE_ELLIPSIS}")
     body_lines.extend(visible_lines)
     return "\n".join(body_lines)
+
+
+class _AgentPageBuilder:
+    """Incrementally build ordered pages without dropping older content."""
+
+    def __init__(self) -> None:
+        self._pages: list[str] = []
+        self._parts: list[str] = []
+
+    def finish(self) -> list[str]:
+        self._flush_page()
+        return self._pages
+
+    def add_text(self, text: str) -> None:
+        clean = text.strip()
+        if not clean:
+            return
+        for chunk in split_message(clean, max_length=_TOOL_BUBBLE_RENDERED_LIMIT):
+            self._append_block(chunk)
+
+    def add_tool_entries(self, entries: list[ToolBatchEntry], title: str) -> None:
+        quote_lines: list[str] = []
+        for entry in entries:
+            line = _format_batch_entry(entry)
+            if self._quote_fits_current([*quote_lines, line], title):
+                quote_lines.append(line)
+                continue
+
+            if quote_lines:
+                self._append_known_fitting_block(_render_tool_bubble(quote_lines, title))
+                quote_lines = []
+
+            if not self._quote_fits_current([line], title):
+                self._flush_page()
+
+            if not self._quote_fits_current([line], title):
+                line = _truncate_line_to_fit(line, title, hidden_count=0)
+            quote_lines.append(line)
+
+        if quote_lines:
+            self._append_known_fitting_block(_render_tool_bubble(quote_lines, title))
+
+    def _current_text(self) -> str:
+        return "\n\n".join(self._parts)
+
+    def _separator_len(self) -> int:
+        return 2 if self._parts else 0
+
+    def _block_fits_current(self, block: str) -> bool:
+        return (
+            len(self._current_text()) + self._separator_len() + len(block)
+            <= _TOOL_BUBBLE_RENDERED_LIMIT
+        )
+
+    def _quote_fits_current(self, lines: list[str], title: str) -> bool:
+        return self._block_fits_current(_render_tool_bubble(lines, title))
+
+    def _append_block(self, block: str) -> None:
+        if self._block_fits_current(block):
+            self._parts.append(block)
+            return
+        self._flush_page()
+        if self._block_fits_current(block):
+            self._parts.append(block)
+            return
+        for chunk in split_message(block, max_length=_TOOL_BUBBLE_RENDERED_LIMIT):
+            if not self._block_fits_current(chunk):
+                self._flush_page()
+            self._parts.append(chunk)
+
+    def _append_known_fitting_block(self, block: str) -> None:
+        if not self._block_fits_current(block):
+            self._flush_page()
+        self._parts.append(block)
+
+    def _flush_page(self) -> None:
+        if not self._parts:
+            return
+        self._pages.append(self._current_text())
+        self._parts = []
+
+
+def _with_page_footers(pages: list[str]) -> list[str]:
+    total = len(pages)
+    if total <= 1:
+        return pages
+    rendered: list[str] = []
+    for index, page in enumerate(pages, 1):
+        footer = f"\n\n[{index}/{total}]"
+        if len(page) + len(footer) <= TELEGRAM_TEXT_LIMIT:
+            rendered.append(f"{page}{footer}")
+        else:
+            available = TELEGRAM_TEXT_LIMIT - len(footer) - len(_TOOL_LINE_ELLIPSIS)
+            rendered.append(f"{page[:available]}{_TOOL_LINE_ELLIPSIS}{footer}")
+    return rendered
 
 
 def _tool_bubble_fits(
@@ -456,37 +552,92 @@ def _entry_from_data(data: dict[str, Any]) -> ToolBatchEntry | None:
         return None
 
 
+def _segment_to_data(segment: AgentBubbleSegment) -> dict[str, Any]:
+    if segment.kind == "text":
+        return {"kind": "text", "text": segment.text}
+    return {
+        "kind": "tools",
+        "entries": [_entry_to_data(entry) for entry in segment.entries],
+    }
+
+
+def _segment_from_data(data: dict[str, Any]) -> AgentBubbleSegment | None:
+    kind = data.get("kind")
+    if kind == "text":
+        return AgentBubbleSegment("text", text=str(data.get("text") or ""))
+    if kind != "tools":
+        return None
+    entries_data = data.get("entries") or []
+    entries = [
+        entry
+        for entry_data in entries_data
+        if isinstance(entry_data, dict)
+        for entry in [_entry_from_data(entry_data)]
+        if entry is not None
+    ]
+    if not entries:
+        return None
+    return AgentBubbleSegment("tools", entries=entries)
+
+
 def _batch_to_data(batch: ToolBatch) -> dict[str, Any]:
     return {
         "window_id": batch.window_id,
         "thread_id": batch.thread_id,
         "telegram_msg_id": batch.telegram_msg_id,
+        "telegram_msg_ids": batch.telegram_msg_ids,
         "total_length": batch.total_length,
         "entries": [_entry_to_data(entry) for entry in batch.entries],
+        "segments": [_segment_to_data(segment) for segment in batch.segments],
     }
 
 
 def _batch_from_data(data: dict[str, Any]) -> ToolBatch | None:
     try:
-        entries_data = data.get("entries") or []
+        segments_data = data.get("segments") or []
+        segments = [
+            segment
+            for segment_data in segments_data
+            if isinstance(segment_data, dict)
+            for segment in [_segment_from_data(segment_data)]
+            if segment is not None
+        ]
         entries = [
             entry
-            for entry_data in entries_data
-            if isinstance(entry_data, dict)
-            for entry in [_entry_from_data(entry_data)]
-            if entry is not None
+            for segment in segments
+            if segment.kind == "tools"
+            for entry in segment.entries
         ]
-        if not entries:
+
+        if not segments:
+            entries_data = data.get("entries") or []
+            entries = [
+                entry
+                for entry_data in entries_data
+                if isinstance(entry_data, dict)
+                for entry in [_entry_from_data(entry_data)]
+                if entry is not None
+            ]
+            if entries:
+                segments = [AgentBubbleSegment("tools", entries=entries)]
+
+        if not segments:
             return None
+        msg_ids = [
+            int(msg_id)
+            for msg_id in data.get("telegram_msg_ids") or []
+            if msg_id is not None
+        ]
+        legacy_msg_id = data.get("telegram_msg_id")
+        if not msg_ids and legacy_msg_id is not None:
+            msg_ids = [int(legacy_msg_id)]
         return ToolBatch(
             window_id=str(data["window_id"]),
             thread_id=int(data["thread_id"]),
             entries=entries,
-            telegram_msg_id=(
-                int(data["telegram_msg_id"])
-                if data.get("telegram_msg_id") is not None
-                else None
-            ),
+            telegram_msg_id=msg_ids[0] if msg_ids else None,
+            telegram_msg_ids=msg_ids,
+            segments=segments,
             total_length=int(data.get("total_length") or 0),
         )
     except (KeyError, TypeError, ValueError):
@@ -575,7 +726,7 @@ def _persist_active_batches() -> None:
             "batch": _batch_to_data(batch),
         }
         for (user_id, thread_id), batch in sorted(_active_batches.items())
-        if batch.entries
+        if _render_segments(batch)
     ]
     if not active_items:
         try:
@@ -603,50 +754,162 @@ async def _send_or_edit_batch(
     raw_thread_id: int | None,
     thread_id_or_0: int,
 ) -> None:
-    """Send a new batch message or edit the existing one in place."""
-    from .status_bubble import clear_status_message
+    """Send or edit all Telegram pages for the active agent turn."""
+    await _sync_batch_pages(
+        bot,
+        user_id,
+        batch,
+        chat_id,
+        raw_thread_id,
+        thread_id_or_0,
+        convert_status=True,
+    )
 
-    batch_text = format_batch_message(batch.entries)
-    await clear_status_message(bot, user_id, thread_id_or_0)
 
-    if batch.telegram_msg_id is None:
-        logger.debug(
-            "tool batch send user=%s thread=%s window=%s entries=%d",
-            user_id,
-            thread_id_or_0,
-            batch.window_id,
-            len(batch.entries),
+async def _sync_batch_pages(
+    bot: Bot,
+    user_id: int,
+    batch: ToolBatch,
+    chat_id: int,
+    raw_thread_id: int | None,
+    thread_id_or_0: int,
+    *,
+    convert_status: bool,
+) -> None:
+    pages = _prepare_batch_pages(batch)
+    if not pages:
+        return
+    if convert_status and not batch.telegram_msg_ids:
+        await _convert_or_clear_status(
+            bot, user_id, batch, thread_id_or_0, pages[0]
         )
-        await _send_fresh_batch_message(
+    await _sync_rendered_pages(bot, user_id, batch, chat_id, raw_thread_id, pages)
+
+
+def _prepare_batch_pages(batch: ToolBatch) -> list[str]:
+    pages = format_agent_pages(_render_segments(batch))
+    if batch.telegram_msg_id and not batch.telegram_msg_ids:
+        batch.telegram_msg_ids = [batch.telegram_msg_id]
+    return pages
+
+
+async def _convert_or_clear_status(
+    bot: Bot,
+    user_id: int,
+    batch: ToolBatch,
+    thread_id_or_0: int,
+    first_page: str,
+) -> None:
+    from .status_bubble import clear_status_message, convert_status_to_content
+
+    converted_msg_id = await convert_status_to_content(
+        bot,
+        user_id,
+        thread_id_or_0,
+        batch.window_id,
+        first_page,
+    )
+    if converted_msg_id is None:
+        await clear_status_message(bot, user_id, thread_id_or_0)
+        return
+    batch.telegram_msg_ids.append(converted_msg_id)
+    batch.telegram_msg_id = converted_msg_id
+    batch.rendered_pages = [first_page]
+
+
+async def _sync_rendered_pages(
+    bot: Bot,
+    user_id: int,
+    batch: ToolBatch,
+    chat_id: int,
+    raw_thread_id: int | None,
+    pages: list[str],
+) -> None:
+    disable_notification = not _batch_has_text(batch)
+    for index, page in enumerate(pages):
+        await _sync_one_page(
             bot,
+            user_id,
             batch,
             chat_id,
             raw_thread_id,
-            batch_text,
+            pages,
+            index,
+            page,
+            disable_notification,
         )
+    await _delete_stale_pages(bot, batch, chat_id, len(pages))
+    batch.telegram_msg_id = batch.telegram_msg_ids[0] if batch.telegram_msg_ids else None
+    batch.rendered_pages = pages
+
+
+async def _sync_one_page(
+    bot: Bot,
+    user_id: int,
+    batch: ToolBatch,
+    chat_id: int,
+    raw_thread_id: int | None,
+    pages: list[str],
+    index: int,
+    page: str,
+    disable_notification: bool,
+) -> None:
+    if index < len(batch.telegram_msg_ids):
+        if index < len(batch.rendered_pages) and batch.rendered_pages[index] == page:
+            return
+        if await _edit_page(bot, user_id, batch, chat_id, pages, index, page):
+            return
+    sent = await _send_fresh_batch_message(
+        bot,
+        batch,
+        chat_id,
+        raw_thread_id,
+        page,
+        disable_notification=disable_notification,
+    )
+    if sent is not None:
+        _store_page_message_id(batch, index, sent)
+
+
+async def _edit_page(
+    bot: Bot,
+    user_id: int,
+    batch: ToolBatch,
+    chat_id: int,
+    pages: list[str],
+    index: int,
+    page: str,
+) -> bool:
+    msg_id = batch.telegram_msg_ids[index]
+    logger.debug(
+        "agent bubble edit user=%s thread=%s window=%s message_id=%s page=%d/%d",
+        user_id,
+        batch.thread_id,
+        batch.window_id,
+        msg_id,
+        index + 1,
+        len(pages),
+    )
+    return await edit_with_fallback(bot, chat_id, msg_id, page)
+
+
+def _store_page_message_id(batch: ToolBatch, index: int, msg_id: int) -> None:
+    if index < len(batch.telegram_msg_ids):
+        batch.telegram_msg_ids[index] = msg_id
     else:
-        logger.debug(
-            "tool batch edit user=%s thread=%s window=%s message_id=%s entries=%d",
-            user_id,
-            thread_id_or_0,
-            batch.window_id,
-            batch.telegram_msg_id,
-            len(batch.entries),
-        )
-        success = await edit_with_fallback(
-            bot,
-            chat_id,
-            batch.telegram_msg_id,
-            batch_text,
-        )
-        if not success:
-            await _send_fresh_batch_message(
-                bot,
-                batch,
-                chat_id,
-                raw_thread_id,
-                batch_text,
-            )
+        batch.telegram_msg_ids.append(msg_id)
+
+
+async def _delete_stale_pages(
+    bot: Bot,
+    batch: ToolBatch,
+    chat_id: int,
+    keep_count: int,
+) -> None:
+    for msg_id in batch.telegram_msg_ids[keep_count:]:
+        with contextlib.suppress(TelegramError):
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    batch.telegram_msg_ids = batch.telegram_msg_ids[:keep_count]
 
 
 async def _send_fresh_batch_message(
@@ -655,13 +918,15 @@ async def _send_fresh_batch_message(
     chat_id: int,
     raw_thread_id: int | None,
     batch_text: str,
-) -> None:
+    *,
+    disable_notification: bool = True,
+) -> int | None:
     sent = await rate_limit_send_message(
         bot,
         chat_id,
         batch_text,
         **send_kwargs(raw_thread_id),
-        disable_notification=True,
+        disable_notification=disable_notification,
     )
     if sent:
         batch.telegram_msg_id = sent.message_id
@@ -672,6 +937,23 @@ async def _send_fresh_batch_message(
             sent.message_id,
             len(batch.entries),
         )
+        return sent.message_id
+    return None
+
+
+def _batch_has_text(batch: ToolBatch) -> bool:
+    return any(
+        segment.kind == "text" and segment.text.strip()
+        for segment in _render_segments(batch)
+    )
+
+
+def _render_segments(batch: ToolBatch) -> list[AgentBubbleSegment]:
+    if batch.segments:
+        return batch.segments
+    if batch.entries:
+        return [AgentBubbleSegment("tools", entries=batch.entries)]
+    return []
 
 
 async def _handle_tool_result(
@@ -753,6 +1035,7 @@ def _add_tool_use_entry(
         tool_name=task.tool_name,
     )
     batch.entries.append(entry)
+    _current_tool_segment(batch).entries.append(entry)
     batch.total_length += len(entry_text)
     logger.debug(
         "tool use added window=%s thread=%s tool_id=%s tool_name=%s entries=%d summary=%r",
@@ -763,6 +1046,26 @@ def _add_tool_use_entry(
         len(batch.entries),
         entry.summary,
     )
+
+
+def _current_tool_segment(batch: ToolBatch) -> AgentBubbleSegment:
+    if batch.segments and batch.segments[-1].kind == "tools":
+        return batch.segments[-1]
+    segment = AgentBubbleSegment("tools")
+    batch.segments.append(segment)
+    return segment
+
+
+def _append_text_segment(batch: ToolBatch, text: str) -> None:
+    clean = text.strip()
+    if not clean:
+        return
+    if batch.segments and batch.segments[-1].kind == "text":
+        existing = batch.segments[-1].text.strip()
+        batch.segments[-1].text = f"{existing}\n\n{clean}" if existing else clean
+    else:
+        batch.segments.append(AgentBubbleSegment("text", text=clean))
+    batch.total_length += len(clean)
 
 
 async def process_tool_event(
@@ -805,6 +1108,38 @@ async def process_tool_event(
     )
     _persist_active_batches()
     return None
+
+
+async def process_agent_message(bot: Bot, user_id: int, task: ContentTask) -> None:
+    """Append assistant text to the active ordered turn bubble."""
+    if task.role != "assistant":
+        return
+
+    window_id = task.window_id
+    thread_id_or_0 = thread_key(task.thread_id)
+    bkey = (user_id, thread_id_or_0)
+    chat_id = thread_router.resolve_chat_id(user_id, task.thread_id)
+    _load_active_batches_if_needed()
+    batch = _active_batches.get(bkey)
+
+    if batch and batch.window_id != window_id:
+        await flush_batch(bot, user_id, thread_id_or_0)
+        batch = None
+
+    if not batch:
+        batch = ToolBatch(window_id=window_id, thread_id=thread_id_or_0)
+        _active_batches[bkey] = batch
+
+    for part in task.parts:
+        _append_text_segment(batch, part)
+
+    await _send_or_edit_batch(
+        bot, user_id, batch, chat_id, task.thread_id, thread_id_or_0
+    )
+
+    if task.phase == "final_answer":
+        _active_batches.pop(bkey, None)
+    _persist_active_batches()
 
 
 async def _handle_tool_use_event(
@@ -868,48 +1203,29 @@ async def flush_batch(bot: Bot, user_id: int, thread_id_or_0: int) -> None:
     _load_active_batches_if_needed()
     bkey = (user_id, thread_id_or_0)
     batch = _active_batches.pop(bkey, None)
-    if not batch or not batch.entries:
+    if not batch or not _render_segments(batch):
         _persist_active_batches()
         return
 
     thread_id: int | None = thread_id_or_0 if thread_id_or_0 != 0 else None
     chat_id = thread_router.resolve_chat_id(user_id, thread_id)
-
-    batch_text = format_batch_message(batch.entries)
     logger.debug(
-        "tool batch flush user=%s thread=%s window=%s message_id=%s entries=%d",
+        "agent bubble flush user=%s thread=%s window=%s message_id=%s entries=%d",
         user_id,
         thread_id_or_0,
         batch.window_id,
         batch.telegram_msg_id,
         len(batch.entries),
     )
-
-    if batch.telegram_msg_id is None:
-        await _send_fresh_batch_message(
-            bot,
-            batch,
-            chat_id,
-            thread_id,
-            batch_text,
-        )
-        _persist_active_batches()
-        return
-
-    success = await edit_with_fallback(
+    await _sync_batch_pages(
         bot,
+        user_id,
+        batch,
         chat_id,
-        batch.telegram_msg_id,
-        batch_text,
+        thread_id,
+        thread_id_or_0,
+        convert_status=False,
     )
-    if not success:
-        await _send_fresh_batch_message(
-            bot,
-            batch,
-            chat_id,
-            thread_id,
-            batch_text,
-        )
     _persist_active_batches()
 
 

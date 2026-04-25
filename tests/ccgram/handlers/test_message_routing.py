@@ -177,3 +177,12 @@ async def test_complete_message_enqueues_content(bot, mock_deps):
     assert kwargs["user_id"] == 100
     assert kwargs["window_id"] == "@5"
     assert kwargs["thread_id"] == 42
+
+
+async def test_user_transcript_entry_enqueues_boundary_without_bot_echo(bot, mock_deps):
+    await handle_new_message(_make_msg(text="prompt", role="user"), bot)
+    mock_deps["brp"].assert_not_called()
+    mock_deps["eq"].assert_called_once()
+    kwargs = mock_deps["eq"].call_args.kwargs
+    assert kwargs["role"] == "user"
+    assert kwargs["parts"] == ["prompt"]

@@ -39,7 +39,7 @@ from .tool_batch import (
     flush_batch,
     flush_if_active,
     has_active_batch,
-    is_batch_eligible,
+    process_agent_message,
     process_tool_event,
 )
 
@@ -295,14 +295,28 @@ async def _handle_content_task(
 
     Returns the number of additional merged tasks (caller must call task_done for each).
     """
-    if is_batch_eligible(task):
-        followup = await process_tool_event(bot, user_id, task)
-        if followup is not None:
-            await _process_content_task(bot, user_id, followup)
+    if task.role == "user":
+        await flush_if_active(bot, user_id, task)
         return 0
 
-    if task.role == "user" or task.phase == "final_answer":
-        await flush_if_active(bot, user_id, task)
+    if task.content_type in ("tool_use", "tool_result"):
+        followup = await process_tool_event(bot, user_id, task)
+        if followup is not None:
+            await process_agent_message(bot, user_id, followup)
+        return 0
+
+    if task.role == "assistant":
+        if _is_recent_duplicate_final(user_id, task):
+            logger.debug(
+                "Suppressing duplicate final answer for user %s thread %s window %s",
+                user_id,
+                thread_key(task.thread_id),
+                task.window_id,
+            )
+            return 0
+        await process_agent_message(bot, user_id, task)
+        _remember_final_send(user_id, task)
+        return 0
 
     merged_task, merge_count = await _merge_content_tasks(queue, task, lock)
     if merge_count > 0:

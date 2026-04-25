@@ -15,6 +15,7 @@ from ccgram.handlers.message_queue import (
 )
 from ccgram.handlers.message_task import ContentTask, MessageTask
 from ccgram.handlers.tool_batch import (
+    AgentBubbleSegment,
     TELEGRAM_TEXT_LIMIT,
     ToolBatch,
     ToolBatchEntry,
@@ -22,16 +23,12 @@ from ccgram.handlers.tool_batch import (
     clear_all_batches,
     clear_batch_for_topic,
     flush_batch,
+    format_agent_pages,
     format_batch_message,
-    is_batch_eligible,
     process_tool_event,
 )
 from ccgram.session import (
-    BATCH_MODES,
-    DEFAULT_BATCH_MODE,
-    SessionManager,
     WindowState,
-    window_store,
 )
 
 
@@ -42,10 +39,6 @@ def batch_env():
             "ccgram.handlers.status_bubble.clear_status_message",
             new_callable=AsyncMock,
         ) as mock_clear,
-        patch(
-            "ccgram.handlers.tool_batch.get_batch_mode",
-            return_value="batched",
-        ),
         patch("ccgram.handlers.tool_batch.rate_limit_send_message") as mock_send,
         patch("ccgram.handlers.tool_batch.thread_router") as mock_tr,
     ):
@@ -121,7 +114,7 @@ class TestFormatBatchMessage:
         assert '⚡ Bash: "make test" ↻' in result
         assert "10 lines" not in result
 
-    def test_rotates_newest_entries_under_telegram_limit(self) -> None:
+    def test_paginates_entries_oldest_first_under_telegram_limit(self) -> None:
         entries = [
             ToolBatchEntry(
                 f"t{i}",
@@ -131,26 +124,13 @@ class TestFormatBatchMessage:
             for i in range(100)
         ]
 
-        result = format_batch_message(entries)
+        pages = format_agent_pages([AgentBubbleSegment("tools", entries=entries)])
 
-        assert len(result) <= TELEGRAM_TEXT_LIMIT
-        assert "earlier tools" in result
-        assert "run-99" in result
-        assert "run-0" not in result
-
-
-class TestIsBatchEligible:
-    @pytest.mark.parametrize("content_type", ["tool_use", "tool_result"])
-    @patch("ccgram.handlers.tool_batch.get_batch_mode", return_value="batched")
-    def test_tool_types_eligible(self, _mock_gbm, content_type: str) -> None:
-        task = ContentTask(window_id="@0", parts=("x",), content_type=content_type)  # type: ignore[arg-type]
-        assert is_batch_eligible(task) is True
-
-    @pytest.mark.parametrize("content_type", ["text", "thinking", "assistant"])
-    @patch("ccgram.handlers.tool_batch.get_batch_mode", return_value="batched")
-    def test_non_tool_types_not_eligible(self, _mock_gbm, content_type: str) -> None:
-        task = ContentTask(window_id="@0", parts=("x",))
-        assert is_batch_eligible(task) is False
+        assert len(pages) > 1
+        assert all(len(page) <= TELEGRAM_TEXT_LIMIT for page in pages)
+        assert "earlier tools" not in "\n".join(pages)
+        assert "run-0" in pages[0]
+        assert "run-99" in pages[-1]
 
 
 class TestBatchDataStructures:
@@ -176,76 +156,12 @@ class TestBatchDataStructures:
         assert batch.total_length == sum(len(f"Read file{i}.py") for i in range(20))
 
 
-class TestWindowStateBatchMode:
-    def test_default_batch_mode(self) -> None:
-        ws = WindowState()
-        assert ws.batch_mode == DEFAULT_BATCH_MODE
-        assert ws.batch_mode == "batched"
-
-    @pytest.mark.parametrize(
-        ("mode", "expect_key"),
-        [("batched", False), ("verbose", True)],
-    )
-    def test_to_dict_batch_mode(self, mode: str, expect_key: bool) -> None:
-        ws = WindowState(session_id="s1", cwd="/tmp", batch_mode=mode)
-        d = ws.to_dict()
-        if expect_key:
-            assert d["batch_mode"] == mode
-        else:
-            assert "batch_mode" not in d
-
-    @pytest.mark.parametrize(
-        ("data", "expected"),
-        [
-            ({"session_id": "s1", "cwd": "/tmp"}, "batched"),
-            ({"session_id": "s1", "cwd": "/tmp", "batch_mode": "verbose"}, "verbose"),
-            ({"session_id": "s1", "cwd": "/tmp", "batch_mode": "batched"}, "batched"),
-        ],
-    )
-    def test_from_dict(self, data: dict[str, str], expected: str) -> None:
-        assert WindowState.from_dict(data).batch_mode == expected
-
-    @pytest.mark.parametrize("mode", list(BATCH_MODES))
-    def test_roundtrip(self, mode: str) -> None:
-        ws = WindowState(session_id="s1", cwd="/tmp", batch_mode=mode)
-        assert WindowState.from_dict(ws.to_dict()).batch_mode == mode
-
-
-@pytest.fixture
-def mgr(monkeypatch) -> SessionManager:
-    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
-    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
-    return SessionManager()
-
-
-class TestSessionManagerBatchMode:
-    def test_get_default(self, mgr: SessionManager) -> None:
-        assert mgr.get_batch_mode("@0") == "batched"
-
-    def test_get_nonexistent_window(self, mgr: SessionManager) -> None:
-        assert mgr.get_batch_mode("@999") == "batched"
-
-    def test_set_mode(self, mgr: SessionManager) -> None:
-        mgr.set_batch_mode("@0", "verbose")
-        assert mgr.get_batch_mode("@0") == "verbose"
-
-    def test_set_mode_validates(self, mgr: SessionManager) -> None:
-        with pytest.raises(ValueError, match="Invalid batch mode"):
-            mgr.set_batch_mode("@0", "invalid")
-
-    @pytest.mark.parametrize(
-        ("start", "expected"),
-        [("batched", "verbose"), ("verbose", "batched")],
-    )
-    def test_cycle(self, mgr: SessionManager, start: str, expected: str) -> None:
-        mgr.set_batch_mode("@0", start)
-        assert mgr.cycle_batch_mode("@0") == expected
-        assert mgr.get_batch_mode("@0") == expected
-
-    def test_get_invalid_stored_mode_returns_default(self, mgr: SessionManager) -> None:
-        state = window_store.get_window_state("@0")
-        state.batch_mode = "garbage"
-        assert mgr.get_batch_mode("@0") == "batched"
+class TestWindowStateLegacyBatchMode:
+    def test_legacy_batch_mode_is_ignored(self) -> None:
+        ws = WindowState.from_dict(
+            {"session_id": "s1", "cwd": "/tmp", "batch_mode": "verbose"}
+        )
+        assert "batch_mode" not in ws.to_dict()
 
 
 class TestProcessBatchTask:
@@ -280,7 +196,7 @@ class TestProcessBatchTask:
         mock_send.assert_awaited_once()
         assert bot.edit_message_text.await_count == 19
 
-    async def test_overflow_rotates_one_bubble_not_multiple_batches(
+    async def test_overflow_creates_ordered_paginated_bubbles(
         self, batch_env
     ) -> None:
         bot, mock_send, _ = batch_env
@@ -299,11 +215,12 @@ class TestProcessBatchTask:
         batch = _active_batches[(1, 10)]
         assert len(batch.entries) == 90
         assert batch.telegram_msg_id == 100
-        mock_send.assert_awaited_once()
-        edited_text = bot.edit_message_text.await_args.kwargs["text"]
-        assert len(edited_text) <= TELEGRAM_TEXT_LIMIT
-        assert "earlier tools" in edited_text
-        assert "command-89" in edited_text
+        assert mock_send.await_count > 1
+        rendered_pages = batch.rendered_pages
+        assert all(len(page) <= TELEGRAM_TEXT_LIMIT for page in rendered_pages)
+        assert "command-0" in rendered_pages[0]
+        assert "command-89" in rendered_pages[-1]
+        assert "earlier tools" not in "\n".join(rendered_pages)
 
     async def test_tool_result_updates_status_without_result_snippet(
         self, batch_env
@@ -335,11 +252,8 @@ class TestProcessBatchTask:
         assert 'Bash: "make test" ❌' in edited_text
         assert "FAILED test_foo" not in edited_text
 
-    @patch(
-        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
-    )
     async def test_assistant_text_between_tool_groups_keeps_one_batch(
-        self, mock_process, batch_env
+        self, batch_env
     ) -> None:
         bot, mock_send, _ = batch_env
         queue: asyncio.Queue[MessageTask] = asyncio.Queue()
@@ -365,11 +279,12 @@ class TestProcessBatchTask:
 
         batch = _active_batches[(1, 10)]
         assert len(batch.entries) == 2
+        assert [segment.kind for segment in batch.segments] == ["tools", "text", "tools"]
         assert batch.telegram_msg_id == 100
         mock_send.assert_awaited_once()
-        mock_process.assert_awaited_once()
         edited_text = bot.edit_message_text.await_args.kwargs["text"]
         assert 'Bash: "first" ↻' in edited_text
+        assert "assistant update" in edited_text
         assert 'Bash: "second" ↻' in edited_text
 
     async def test_tool_result_no_matching_entry_updates_pending_without_flushing(
@@ -538,11 +453,8 @@ class TestHandleContentTask:
         assert extra == 0
         mock_batch.assert_awaited_once()
 
-    @patch("ccgram.handlers.tool_batch.get_batch_mode", return_value="verbose")
-    @patch(
-        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
-    )
-    async def test_verbose_mode_skips_batch(self, mock_process, _mock_gbm) -> None:
+    @patch("ccgram.handlers.message_queue.process_tool_event", new_callable=AsyncMock)
+    async def test_tool_event_routes_to_ordered_bubble(self, mock_tool_event) -> None:
         bot = AsyncMock()
         queue: asyncio.Queue[MessageTask] = asyncio.Queue()
         lock = asyncio.Lock()
@@ -553,13 +465,11 @@ class TestHandleContentTask:
         )
         extra = await _handle_content_task(bot, 1, task, queue, lock)
         assert extra == 0
-        mock_process.assert_awaited_once()
+        mock_tool_event.assert_awaited_once_with(bot, 1, task)
 
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
-    @patch(
-        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
-    )
-    async def test_assistant_text_keeps_active_batch(self, mock_process, mock_flush) -> None:
+    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
+    async def test_assistant_text_keeps_active_batch(self, mock_agent, mock_flush) -> None:
         bot = AsyncMock()
         queue: asyncio.Queue[MessageTask] = asyncio.Queue()
         lock = asyncio.Lock()
@@ -570,13 +480,11 @@ class TestHandleContentTask:
         )
         await _handle_content_task(bot, 1, task, queue, lock)
         mock_flush.assert_not_awaited()
-        mock_process.assert_awaited_once()
+        mock_agent.assert_awaited_once_with(bot, 1, task)
 
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
-    @patch(
-        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
-    )
-    async def test_final_text_flushes_active_batch(self, mock_process, mock_flush) -> None:
+    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
+    async def test_final_text_finishes_agent_bubble(self, mock_agent, mock_flush) -> None:
         bot = AsyncMock()
         queue: asyncio.Queue[MessageTask] = asyncio.Queue()
         lock = asyncio.Lock()
@@ -587,8 +495,8 @@ class TestHandleContentTask:
             phase="final_answer",
         )
         await _handle_content_task(bot, 1, task, queue, lock)
-        mock_flush.assert_awaited_once_with(bot, 1, task)
-        mock_process.assert_awaited_once()
+        mock_flush.assert_not_awaited()
+        mock_agent.assert_awaited_once_with(bot, 1, task)
 
 
 class TestFlushBatch:
