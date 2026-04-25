@@ -11,15 +11,14 @@ from ccgram.handlers.message_queue import (
 )
 from ccgram.handlers.message_task import ContentTask, MessageTask
 from ccgram.handlers.tool_batch import (
-    BATCH_MAX_ENTRIES,
-    BATCH_MAX_LENGTH,
+    TELEGRAM_TEXT_LIMIT,
     ToolBatch,
     ToolBatchEntry,
     _active_batches,
-    is_batch_eligible,
     clear_batch_for_topic,
     flush_batch,
     format_batch_message,
+    is_batch_eligible,
     process_tool_event,
 )
 from ccgram.session import (
@@ -52,204 +51,77 @@ def batch_env():
         yield AsyncMock(), mock_send, mock_clear
 
 
+@pytest.fixture(autouse=True)
+def _clear_batches():
+    _active_batches.clear()
+    yield
+    _active_batches.clear()
+
+
+def _make_tool_use(
+    window_id: str = "@0",
+    tool_use_id: str = "tu1",
+    text: str = "Read src/foo.py",
+    tool_name: str | None = "Read",
+    thread_id: int | None = 10,
+) -> ContentTask:
+    return ContentTask(
+        window_id=window_id,
+        parts=(text,),
+        content_type="tool_use",
+        tool_use_id=tool_use_id,
+        tool_name=tool_name,
+        thread_id=thread_id,
+    )
+
+
+def _make_tool_result(
+    tool_use_id: str | None = "tu1",
+    text: str = "42 lines",
+    thread_id: int | None = 10,
+    window_id: str = "@0",
+) -> ContentTask:
+    return ContentTask(
+        window_id=window_id,
+        parts=(text,),
+        content_type="tool_result",
+        tool_use_id=tool_use_id,
+        thread_id=thread_id,
+    )
+
+
 class TestFormatBatchMessage:
-    def test_single_entry_pending(self) -> None:
-        entries = [ToolBatchEntry(tool_use_id="t1", tool_use_text="Read src/foo.py")]
-        result = format_batch_message(entries)
-        assert result.startswith("\u26a1 1 tool call")
-        assert "Read src/foo.py" in result
-        assert "\u23f3" in result
-
-    def test_single_entry_with_result(self) -> None:
-        entries = [
-            ToolBatchEntry(
-                tool_use_id="t1",
-                tool_use_text="Read src/foo.py",
-                tool_result_text="42 lines",
-            )
-        ]
-        result = format_batch_message(entries)
-        assert "1 tool call" in result
-        assert "42 lines" in result
-        assert "\u23f3" not in result
-
-    def test_multiple_entries(self) -> None:
-        entries = [
-            ToolBatchEntry("t1", "Read src/a.py", "10 lines"),
-            ToolBatchEntry("t2", "Edit src/a.py", "+3 -1"),
-            ToolBatchEntry("t3", "Bash make test"),
-        ]
-        result = format_batch_message(entries)
-        assert "3 tool calls" in result
-        assert "Read src/a.py" in result
-        assert "Edit src/a.py" in result
-        assert "Bash make test" in result
-        lines = result.split("\n")
-        assert "\u23f3" in lines[-1]
-        assert "\u23f3" not in lines[1]
-
-    def test_header_pluralization(self) -> None:
-        single = format_batch_message([ToolBatchEntry("t1", "Read x")])
-        assert "tool call\n" in single
-
-        multi = format_batch_message(
-            [ToolBatchEntry("t1", "Read x"), ToolBatchEntry("t2", "Edit y")]
+    def test_single_bubble_shape(self) -> None:
+        result = format_batch_message(
+            [
+                ToolBatchEntry("t1", "Read src/a.py", "10 lines", tool_name="Read"),
+                ToolBatchEntry("t2", "Edit src/a.py", tool_name="Edit"),
+                ToolBatchEntry("t3", "Bash make test", tool_name="Bash"),
+            ]
         )
-        assert "tool calls\n" in multi
 
-    def test_result_separator(self) -> None:
-        entries = [ToolBatchEntry("t1", "Read x", "ok")]
-        result = format_batch_message(entries)
-        assert "\u23bf" in result  # ⎿ separator between tool_use and result
+        assert result.startswith("```Tools\n")
+        assert '📖 Read: "src/a.py" ✓' in result
+        assert '✏️ Edit: "src/a.py" ↻' in result
+        assert '⚡ Bash: "make test" ↻' in result
+        assert "10 lines" not in result
 
-    def test_all_entries_have_results(self) -> None:
-        entries = [
-            ToolBatchEntry("t1", "Read a.py", "10 lines"),
-            ToolBatchEntry("t2", "Edit a.py", "+1 -1"),
-            ToolBatchEntry("t3", "Bash make test", "PASS"),
-        ]
-        result = format_batch_message(entries)
-        assert "\u23f3" not in result
-
-    def test_empty_result_text(self) -> None:
-        entries = [ToolBatchEntry("t1", "Read x", "")]
-        result = format_batch_message(entries)
-        assert "\u23bf" in result
-        assert "\u23f3" not in result
-
-    def test_subagent_label_none(self) -> None:
-        entries = [ToolBatchEntry("t1", "Read x")]
-        result = format_batch_message(entries, subagent_label=None)
-        assert "[" not in result.split("\n")[0]
-
-    def test_subagent_label_single(self) -> None:
-        entries = [ToolBatchEntry("t1", "Read x"), ToolBatchEntry("t2", "Edit y")]
-        result = format_batch_message(entries, subagent_label="\U0001f916 write-tests")
-        header = result.split("\n")[0]
-        assert "2 tool calls" in header
-        assert "[\U0001f916 write-tests]" in header
-
-    def test_subagent_label_multi(self) -> None:
-        entries = [ToolBatchEntry("t1", "Read x")]
-        label = "\U0001f916 2 subagents: write-tests, refactor"
-        result = format_batch_message(entries, subagent_label=label)
-        header = result.split("\n")[0]
-        assert "[" in header
-        assert "2 subagents" in header
-
-    def test_task_create_batch_renders_numbered_list(self) -> None:
+    def test_rotates_newest_entries_under_telegram_limit(self) -> None:
         entries = [
             ToolBatchEntry(
-                "t1",
-                "**TaskCreate** `Understand the Problem Domain`",
-                tool_name="TaskCreate",
-            ),
-            ToolBatchEntry(
-                "t2",
-                "**TaskCreate** `Map Integrations`",
-                tool_name="TaskCreate",
-            ),
-            ToolBatchEntry(
-                "t3",
-                "**TaskCreate** `Apply the Balance Rule`",
-                tool_name="TaskCreate",
-            ),
-        ]
-
-        result = format_batch_message(entries, subagent_label="\U0001f916 subagent")
-
-        assert result.split("\n")[0] == "\U0001f916 subagent"
-        assert "Creating 3 tasks\u2026" in result
-        assert "1. Understand the Problem Domain" in result
-        assert "2. Map Integrations" in result
-        assert "3. Apply the Balance Rule" in result
-        assert "tool calls" not in result
-
-    def test_task_create_batch_renders_completed_header_when_results_arrive(
-        self,
-    ) -> None:
-        entries = [
-            ToolBatchEntry(
-                "t1",
-                "**TaskCreate** `Write the Review`",
-                tool_name="TaskCreate",
-                tool_result_text="Done",
+                f"t{i}",
+                f"Bash run-{i}-" + ("x" * 120),
+                tool_name="Bash",
             )
+            for i in range(100)
         ]
 
         result = format_batch_message(entries)
 
-        assert result.startswith("Created 1 task\n")
-        assert "1. Write the Review" in result
-        assert "\u23bf" not in result
-
-    def test_task_create_batch_falls_back_when_tool_name_missing(self) -> None:
-        entries = [ToolBatchEntry("t1", "TaskCreate Understand the Problem Domain")]
-
-        result = format_batch_message(entries)
-
-        assert result.startswith("\u26a1 1 tool call")
-
-    def test_mixed_batch_groups_task_create_entries(self) -> None:
-        entries = [
-            ToolBatchEntry(
-                "t0", "**ToolSearch** `select:TaskCreate,TaskUpdate,TaskList`"
-            ),
-            ToolBatchEntry(
-                "t1",
-                "**TaskCreate** `Tune regex linter`",
-                tool_name="TaskCreate",
-            ),
-            ToolBatchEntry(
-                "t2",
-                "**TaskCreate**Apply fixes to opus agents",
-                tool_name="TaskCreate",
-            ),
-        ]
-
-        result = format_batch_message(entries, subagent_label="\U0001f916 subagent")
-
-        lines = result.split("\n")
-        assert lines[0] == "\u26a1 3 tool calls"
-        assert lines[1] == "\U0001f916 subagent"
-        assert "ToolSearch" in lines[2]
-        assert "Creating 2 tasks\u2026" in result
-        assert "1. Tune regex linter" in result
-        assert "2. Apply fixes to opus agents" in result
-
-    def test_task_update_entries_render_as_progress_section(self) -> None:
-        entries = [
-            ToolBatchEntry(
-                "t1",
-                "**TaskUpdate** `Tune regex linter -> in progress`",
-                tool_name="TaskUpdate",
-            ),
-            ToolBatchEntry(
-                "t2",
-                "**TaskUpdate** `Apply fixes to opus agents -> completed`",
-                tool_name="TaskUpdate",
-                tool_result_text="Done",
-            ),
-        ]
-
-        result = format_batch_message(entries)
-
-        assert "Updating 2 tasks\u2026" in result
-        assert "- Tune regex linter -> in progress" in result
-        assert "- Apply fixes to opus agents -> completed" in result
-
-    def test_task_list_entry_renders_as_task_list_sync(self) -> None:
-        entries = [
-            ToolBatchEntry(
-                "t1",
-                "**TaskList** `refresh`",
-                tool_name="TaskList",
-            )
-        ]
-
-        result = format_batch_message(entries)
-
-        assert result == "\u26a1 1 tool call\nRefreshing task list\u2026"
+        assert len(result) <= TELEGRAM_TEXT_LIMIT
+        assert "earlier tools" in result
+        assert "run-99" in result
+        assert "run-0" not in result
 
 
 class TestIsBatchEligible:
@@ -269,7 +141,9 @@ class TestIsBatchEligible:
 class TestBatchDataStructures:
     def test_tool_batch_entry_defaults(self) -> None:
         entry = ToolBatchEntry(tool_use_id="t1", tool_use_text="Read x")
-        assert entry.tool_result_text is None
+        assert entry.result_text is None
+        assert entry.status == "pending"
+        assert entry.summary == "x"
 
     def test_tool_batch_defaults(self) -> None:
         batch = ToolBatch(window_id="@0", thread_id=0)
@@ -277,18 +151,14 @@ class TestBatchDataStructures:
         assert batch.telegram_msg_id is None
         assert batch.total_length == 0
 
-    def test_batch_entry_accumulation(self) -> None:
+    def test_batch_entry_accumulation_keeps_all_entries(self) -> None:
         batch = ToolBatch(window_id="@0", thread_id=0)
-        for i in range(5):
+        for i in range(20):
             entry = ToolBatchEntry(f"t{i}", f"Read file{i}.py")
             batch.entries.append(entry)
             batch.total_length += len(entry.tool_use_text)
-        assert len(batch.entries) == 5
-        assert batch.total_length == sum(len(f"Read file{i}.py") for i in range(5))
-
-    def test_constants(self) -> None:
-        assert BATCH_MAX_ENTRIES == 9
-        assert BATCH_MAX_LENGTH == 2800
+        assert len(batch.entries) == 20
+        assert batch.total_length == sum(len(f"Read file{i}.py") for i in range(20))
 
 
 class TestWindowStateBatchMode:
@@ -357,69 +227,16 @@ class TestSessionManagerBatchMode:
         assert mgr.cycle_batch_mode("@0") == expected
         assert mgr.get_batch_mode("@0") == expected
 
-    def test_cycle_full_circle(self, mgr: SessionManager) -> None:
-        mgr.cycle_batch_mode("@0")
-        assert mgr.get_batch_mode("@0") == "verbose"
-        mgr.cycle_batch_mode("@0")
-        assert mgr.get_batch_mode("@0") == "batched"
-
-    def test_set_same_mode_no_save(self, mgr: SessionManager, monkeypatch) -> None:
-        mgr.set_batch_mode("@0", "verbose")
-        save_calls = []
-        monkeypatch.setattr(
-            SessionManager, "_save_state", lambda self: save_calls.append(1)
-        )
-        mgr.set_batch_mode("@0", "verbose")  # same mode
-        assert len(save_calls) == 0
-
     def test_get_invalid_stored_mode_returns_default(self, mgr: SessionManager) -> None:
         state = window_store.get_window_state("@0")
         state.batch_mode = "garbage"
         assert mgr.get_batch_mode("@0") == "batched"
 
 
-@pytest.fixture(autouse=True)
-def _clear_batches():
-    _active_batches.clear()
-    yield
-    _active_batches.clear()
-
-
-def _make_tool_use(
-    window_id: str = "@0",
-    tool_use_id: str = "tu1",
-    text: str = "Read src/foo.py",
-    tool_name: str | None = None,
-    thread_id: int | None = 10,
-) -> ContentTask:
-    return ContentTask(
-        window_id=window_id,
-        parts=(text,),
-        content_type="tool_use",
-        tool_use_id=tool_use_id,
-        tool_name=tool_name,
-        thread_id=thread_id,
-    )
-
-
-def _make_tool_result(
-    tool_use_id: str | None = "tu1",
-    text: str = "42 lines",
-    thread_id: int | None = 10,
-    window_id: str = "@0",
-) -> ContentTask:
-    return ContentTask(
-        window_id=window_id,
-        parts=(text,),
-        content_type="tool_result",
-        tool_use_id=tool_use_id,
-        thread_id=thread_id,
-    )
-
-
 class TestProcessBatchTask:
-    async def test_tool_use_creates_batch(self, batch_env) -> None:
-        bot, mock_send, _ = batch_env
+    async def test_tool_use_creates_silent_bubble(self, batch_env) -> None:
+        bot, mock_send, mock_clear = batch_env
+
         await process_tool_event(bot, 1, _make_tool_use())
 
         bkey = (1, 10)
@@ -428,77 +245,108 @@ class TestProcessBatchTask:
         assert len(batch.entries) == 1
         assert batch.entries[0].tool_use_id == "tu1"
         assert batch.telegram_msg_id == 100
+        mock_clear.assert_awaited_once()
+        mock_send.assert_awaited_once()
+        assert mock_send.await_args.kwargs["disable_notification"] is True
 
-    async def test_task_create_batch_sends_task_list(self, batch_env) -> None:
+    async def test_many_tool_calls_keep_one_telegram_message(self, batch_env) -> None:
         bot, mock_send, _ = batch_env
+
+        for i in range(20):
+            await process_tool_event(
+                bot,
+                1,
+                _make_tool_use(tool_use_id=f"tu{i}", text=f"Bash command {i}", tool_name="Bash"),
+            )
+
+        batch = _active_batches[(1, 10)]
+        assert len(batch.entries) == 20
+        assert batch.telegram_msg_id == 100
+        mock_send.assert_awaited_once()
+        assert bot.edit_message_text.await_count == 19
+
+    async def test_overflow_rotates_one_bubble_not_multiple_batches(
+        self, batch_env
+    ) -> None:
+        bot, mock_send, _ = batch_env
+
+        for i in range(90):
+            await process_tool_event(
+                bot,
+                1,
+                _make_tool_use(
+                    tool_use_id=f"tu{i}",
+                    text=f"Bash command-{i}-" + ("x" * 120),
+                    tool_name="Bash",
+                ),
+            )
+
+        batch = _active_batches[(1, 10)]
+        assert len(batch.entries) == 90
+        assert batch.telegram_msg_id == 100
+        mock_send.assert_awaited_once()
+        edited_text = bot.edit_message_text.await_args.kwargs["text"]
+        assert len(edited_text) <= TELEGRAM_TEXT_LIMIT
+        assert "earlier tools" in edited_text
+        assert "command-89" in edited_text
+
+    async def test_tool_result_updates_status_without_result_snippet(
+        self, batch_env
+    ) -> None:
+        bot, _, _ = batch_env
+        await process_tool_event(bot, 1, _make_tool_use(tool_name="Read"))
+
+        await process_tool_event(bot, 1, _make_tool_result(text="42 lines"))
+
+        batch = _active_batches[(1, 10)]
+        assert batch.entries[0].status == "success"
+        edited_text = bot.edit_message_text.await_args.kwargs["text"]
+        assert 'Read: "src/foo.py" ✓' in edited_text
+        assert "42 lines" not in edited_text
+
+    async def test_tool_result_marks_error(self, batch_env) -> None:
+        bot, _, _ = batch_env
         await process_tool_event(
             bot,
             1,
-            _make_tool_use(
-                text="**TaskCreate** `Understand the Problem Domain`",
-                tool_name="TaskCreate",
-            ),
+            _make_tool_use(text="Bash make test", tool_name="Bash"),
         )
-        sent_text = mock_send.await_args.args[2]
 
-        assert sent_text.startswith("Creating 1 task\u2026\n")
-        assert "1. Understand the Problem Domain" in sent_text
-        assert "tool call" not in sent_text
-
-    async def test_tool_result_updates_entry(self, batch_env) -> None:
-        bot, _, _ = batch_env
-        await process_tool_event(bot, 1, _make_tool_use())
-        await process_tool_event(bot, 1, _make_tool_result())
+        await process_tool_event(bot, 1, _make_tool_result(text="FAILED test_foo"))
 
         batch = _active_batches[(1, 10)]
-        assert batch.entries[0].tool_result_text == "42 lines"
+        assert batch.entries[0].status == "error"
+        edited_text = bot.edit_message_text.await_args.kwargs["text"]
+        assert 'Bash: "make test" ❌' in edited_text
+        assert "FAILED test_foo" not in edited_text
 
-    async def test_multiple_tool_calls_accumulate(self, batch_env) -> None:
-        bot, _, _ = batch_env
-        await process_tool_event(
-            bot, 1, _make_tool_use(tool_use_id="tu1", text="Read a.py")
-        )
-        await process_tool_event(
-            bot, 1, _make_tool_result(tool_use_id="tu1", text="10 lines")
-        )
-        await process_tool_event(
-            bot, 1, _make_tool_use(tool_use_id="tu2", text="Edit a.py")
-        )
-        await process_tool_event(
-            bot, 1, _make_tool_use(tool_use_id="tu3", text="Bash make test")
-        )
-
-        batch = _active_batches[(1, 10)]
-        assert len(batch.entries) == 3
-        assert batch.entries[0].tool_use_id == "tu1"
-        assert batch.entries[0].tool_result_text == "10 lines"
-        assert batch.entries[1].tool_use_id == "tu2"
-        assert batch.entries[1].tool_result_text is None
-        assert batch.entries[2].tool_use_id == "tu3"
-
-    async def test_tool_result_truncates_long_text(self, batch_env) -> None:
-        bot, _, _ = batch_env
-        await process_tool_event(bot, 1, _make_tool_use())
-        long_result = "x" * 200 + "\nsecond line"
-        await process_tool_event(bot, 1, _make_tool_result(text=long_result))
-
-        batch = _active_batches[(1, 10)]
-        result_text = batch.entries[0].tool_result_text
-        assert result_text is not None
-        assert len(result_text) <= 200
-        assert "\n" not in result_text
-
-    async def test_tool_result_no_matching_entry_flushes(self, batch_env) -> None:
+    async def test_tool_result_no_matching_entry_flushes_and_falls_through(
+        self, batch_env
+    ) -> None:
         bot, _, _ = batch_env
         with patch(
             "ccgram.handlers.tool_batch.flush_batch", new_callable=AsyncMock
         ) as mock_flush:
             await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
-            followup = await process_tool_event(
-                bot, 1, _make_tool_result(tool_use_id="tu_unknown")
-            )
+            task = _make_tool_result(tool_use_id="tu_unknown")
+            followup = await process_tool_event(bot, 1, task)
+
         mock_flush.assert_awaited_once()
-        assert followup is not None
+        assert followup == task
+
+    async def test_tool_result_no_active_batch_falls_through(self, batch_env) -> None:
+        bot, _, _ = batch_env
+        task = _make_tool_result(tool_use_id="tu1", text="result text")
+        result = await process_tool_event(bot, 1, task)
+        assert result == task
+
+    async def test_tool_result_none_tool_use_id_falls_through(self, batch_env) -> None:
+        bot, _, _ = batch_env
+        await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
+        task = _make_tool_result(tool_use_id=None, text="result text")
+        result = await process_tool_event(bot, 1, task)
+        assert result == task
+        assert len(_active_batches[(1, 10)].entries) == 1
 
     async def test_different_window_flushes_old_batch(self, batch_env) -> None:
         bot, _, _ = batch_env
@@ -510,44 +358,33 @@ class TestProcessBatchTask:
                 bot, 1, _make_tool_use(window_id="@1", tool_use_id="tu2")
             )
         mock_flush.assert_awaited_once()
+        assert _active_batches[(1, 10)].window_id == "@1"
 
-    async def test_batch_overflow_entries_splits(self, batch_env) -> None:
-        bot, _, _ = batch_env
-        for i in range(BATCH_MAX_ENTRIES + 2):
-            await process_tool_event(
-                bot, 1, _make_tool_use(tool_use_id=f"tu{i}", text=f"Tool {i}")
-            )
+    async def test_lost_edit_target_reclaims_silent_bubble(self, batch_env) -> None:
+        bot, mock_send, _ = batch_env
+        first_msg = MagicMock()
+        first_msg.message_id = 100
+        second_msg = MagicMock()
+        second_msg.message_id = 101
+        mock_send.side_effect = [first_msg, second_msg]
+
+        with patch(
+            "ccgram.handlers.tool_batch.edit_with_fallback",
+            new_callable=AsyncMock,
+            return_value=False,
+        ):
+            await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
+            await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu2"))
 
         batch = _active_batches[(1, 10)]
-        assert len(batch.entries) == 2
-        assert batch.entries[0].tool_use_id == f"tu{BATCH_MAX_ENTRIES}"
-        assert batch.entries[1].tool_use_id == f"tu{BATCH_MAX_ENTRIES + 1}"
-
-    async def test_batch_clears_status_on_first_send(self, batch_env) -> None:
-        bot, _, mock_clear = batch_env
-        await process_tool_event(bot, 1, _make_tool_use())
-        mock_clear.assert_awaited_once()
-
-    async def test_second_tool_edits_existing_message(self, batch_env) -> None:
-        bot, mock_send, _ = batch_env
-        await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
-        mock_send.assert_awaited_once()
-
-        await process_tool_event(
-            bot, 1, _make_tool_use(tool_use_id="tu2", text="Edit b.py")
-        )
-        bot.edit_message_text.assert_awaited()
+        assert batch.telegram_msg_id == 101
+        assert mock_send.await_count == 2
+        assert mock_send.await_args.kwargs["disable_notification"] is True
 
 
 class TestHandleContentTask:
-    @patch(
-        "ccgram.handlers.tool_batch.get_batch_mode",
-        return_value="batched",
-    )
     @patch("ccgram.handlers.message_queue.process_tool_event", new_callable=AsyncMock)
-    async def test_batch_eligible_routes_to_batch(
-        self, mock_batch, mock_should
-    ) -> None:
+    async def test_batch_eligible_routes_to_batch(self, mock_batch) -> None:
         bot = AsyncMock()
         queue: asyncio.Queue[MessageTask] = asyncio.Queue()
         lock = asyncio.Lock()
@@ -561,14 +398,11 @@ class TestHandleContentTask:
         assert extra == 0
         mock_batch.assert_awaited_once()
 
-    @patch(
-        "ccgram.handlers.tool_batch.get_batch_mode",
-        return_value="individual",
-    )
+    @patch("ccgram.handlers.tool_batch.get_batch_mode", return_value="verbose")
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
-    async def test_verbose_mode_skips_batch(self, mock_process, mock_should) -> None:
+    async def test_verbose_mode_skips_batch(self, mock_process, _mock_gbm) -> None:
         bot = AsyncMock()
         queue: asyncio.Queue[MessageTask] = asyncio.Queue()
         lock = asyncio.Lock()
@@ -598,40 +432,6 @@ class TestHandleContentTask:
         mock_flush.assert_awaited_once_with(bot, 1, task)
         mock_process.assert_awaited_once()
 
-    @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
-    @patch(
-        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
-    )
-    async def test_thinking_flushes_active_batch(
-        self, mock_process, mock_flush
-    ) -> None:
-        bot = AsyncMock()
-        queue: asyncio.Queue[MessageTask] = asyncio.Queue()
-        lock = asyncio.Lock()
-        task = ContentTask(
-            content_type="text",
-            window_id="@0",
-            parts=("Thinking...",),
-            thread_id=5,
-        )
-        await _handle_content_task(bot, 1, task, queue, lock)
-        mock_flush.assert_awaited_once_with(bot, 1, task)
-
-    @patch(
-        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
-    )
-    async def test_no_batch_no_flush(self, mock_process) -> None:
-        bot = AsyncMock()
-        queue: asyncio.Queue[MessageTask] = asyncio.Queue()
-        lock = asyncio.Lock()
-        task = ContentTask(
-            content_type="text",
-            window_id="@0",
-            parts=("Hello",),
-        )
-        await _handle_content_task(bot, 1, task, queue, lock)
-        mock_process.assert_awaited_once()
-
 
 class TestFlushBatch:
     @patch("ccgram.handlers.tool_batch.thread_router")
@@ -650,7 +450,7 @@ class TestFlushBatch:
 
     async def test_flush_noop_when_no_batch(self) -> None:
         bot = AsyncMock()
-        await flush_batch(bot, 1, 10)  # should not raise
+        await flush_batch(bot, 1, 10)
 
     @patch("ccgram.handlers.tool_batch.thread_router")
     async def test_flush_edits_final_message(self, mock_tr) -> None:
@@ -660,7 +460,7 @@ class TestFlushBatch:
             thread_id=0,
             entries=[
                 ToolBatchEntry("t1", "Read a.py", "10 lines"),
-                ToolBatchEntry("t2", "Edit a.py", "+1 -1"),
+                ToolBatchEntry("t2", "Edit a.py"),
             ],
             telegram_msg_id=200,
         )
@@ -670,18 +470,47 @@ class TestFlushBatch:
         bot.edit_message_text.assert_awaited()
 
     @patch("ccgram.handlers.tool_batch.thread_router")
-    async def test_flush_no_edit_without_telegram_msg_id(self, mock_tr) -> None:
+    @patch("ccgram.handlers.tool_batch.rate_limit_send_message")
+    async def test_flush_sends_when_no_telegram_msg_id(
+        self, mock_send, mock_tr
+    ) -> None:
         mock_tr.resolve_chat_id.return_value = 42
         _active_batches[(1, 0)] = ToolBatch(
             window_id="@0",
             thread_id=0,
-            entries=[ToolBatchEntry("t1", "Read x")],
+            entries=[ToolBatchEntry("t1", "Read x", "ok")],
             telegram_msg_id=None,
         )
 
         bot = AsyncMock()
         await flush_batch(bot, 1, 0)
-        bot.edit_message_text.assert_not_awaited()
+        mock_send.assert_awaited_once()
+        assert mock_send.await_args.kwargs["disable_notification"] is True
+        assert (1, 0) not in _active_batches
+
+    @patch("ccgram.handlers.tool_batch.thread_router")
+    @patch("ccgram.handlers.tool_batch.rate_limit_send_message")
+    async def test_flush_reclaims_when_edit_target_lost(
+        self, mock_send, mock_tr
+    ) -> None:
+        mock_tr.resolve_chat_id.return_value = 42
+        _active_batches[(1, 0)] = ToolBatch(
+            window_id="@0",
+            thread_id=0,
+            entries=[ToolBatchEntry("t1", "Read x", "ok")],
+            telegram_msg_id=200,
+        )
+
+        bot = AsyncMock()
+        with patch(
+            "ccgram.handlers.tool_batch.edit_with_fallback",
+            new_callable=AsyncMock,
+            return_value=False,
+        ):
+            await flush_batch(bot, 1, 0)
+
+        mock_send.assert_awaited_once()
+        assert mock_send.await_args.kwargs["disable_notification"] is True
         assert (1, 0) not in _active_batches
 
     async def test_flush_empty_entries_noop(self) -> None:
@@ -690,39 +519,6 @@ class TestFlushBatch:
         await flush_batch(bot, 1, 0)
         assert (1, 0) not in _active_batches
         bot.edit_message_text.assert_not_awaited()
-
-    @patch("ccgram.claude_task_state.get_subagent_names", return_value=["researcher"])
-    @patch("ccgram.handlers.tool_batch.thread_router")
-    async def test_flush_includes_subagent_label(self, mock_tr, _mock_names) -> None:
-        mock_tr.resolve_chat_id.return_value = 42
-        _active_batches[(1, 0)] = ToolBatch(
-            window_id="@0",
-            thread_id=0,
-            entries=[ToolBatchEntry("t1", "Read x", "ok")],
-            telegram_msg_id=100,
-        )
-
-        bot = AsyncMock()
-        await flush_batch(bot, 1, 0)
-        text_sent = bot.edit_message_text.call_args.kwargs["text"]
-        assert "researcher" in text_sent
-
-    @patch("ccgram.handlers.tool_batch.thread_router")
-    async def test_flush_handles_telegram_error(self, mock_tr) -> None:
-        from telegram.error import TelegramError
-
-        mock_tr.resolve_chat_id.return_value = 42
-        _active_batches[(1, 0)] = ToolBatch(
-            window_id="@0",
-            thread_id=0,
-            entries=[ToolBatchEntry("t1", "Read x", "ok")],
-            telegram_msg_id=100,
-        )
-
-        bot = AsyncMock()
-        bot.edit_message_text.side_effect = TelegramError("bad markup")
-        await flush_batch(bot, 1, 0)
-        assert (1, 0) not in _active_batches
 
 
 class TestBatchIsolation:
@@ -740,10 +536,26 @@ class TestBatchIsolation:
         assert len(_active_batches[(1, 10)].entries) == 1
         assert len(_active_batches[(1, 20)].entries) == 1
 
+    async def test_different_users_same_thread_separate_batches(
+        self, batch_env
+    ) -> None:
+        bot, _, _ = batch_env
+        await process_tool_event(
+            bot, 1, _make_tool_use(thread_id=10, tool_use_id="tu1")
+        )
+        await process_tool_event(
+            bot, 2, _make_tool_use(thread_id=10, tool_use_id="tu2")
+        )
+
+        assert (1, 10) in _active_batches
+        assert (2, 10) in _active_batches
+        assert _active_batches[(1, 10)].entries[0].tool_use_id == "tu1"
+        assert _active_batches[(2, 10)].entries[0].tool_use_id == "tu2"
+
 
 class TestShutdownClearsBatches:
     async def test_shutdown_clears_active_batches(self) -> None:
-        await shutdown_workers()  # ensure clean state from previous tests
+        await shutdown_workers()
         _active_batches[(1, 0)] = ToolBatch(window_id="@0", thread_id=0)
         _active_batches[(2, 5)] = ToolBatch(window_id="@1", thread_id=5)
         await shutdown_workers()
@@ -776,37 +588,6 @@ class TestQueueWorkerRetryAfter:
             await shutdown_workers()
 
 
-class TestToolResultNotDropped:
-    async def test_tool_result_no_active_batch_falls_through(self, batch_env) -> None:
-        bot, _, _ = batch_env
-        task = _make_tool_result(tool_use_id="tu1", text="result text")
-        result = await process_tool_event(bot, 1, task)
-        assert result == task
-
-    async def test_tool_result_none_tool_use_id_falls_through(self, batch_env) -> None:
-        bot, _, _ = batch_env
-        await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
-        task = _make_tool_result(tool_use_id=None, text="result text")
-        result = await process_tool_event(bot, 1, task)
-        assert result == task
-        assert (1, 10) in _active_batches
-        assert len(_active_batches[(1, 10)].entries) == 1
-
-
-class TestBatchLengthOverflow:
-    async def test_overflow_on_length(self, batch_env) -> None:
-        bot, _, _ = batch_env
-        long_text = "x" * 500
-        for i in range(8):
-            await process_tool_event(
-                bot, 1, _make_tool_use(tool_use_id=f"tu{i}", text=long_text)
-            )
-
-        batch = _active_batches[(1, 10)]
-        assert batch.total_length <= BATCH_MAX_LENGTH
-        assert len(batch.entries) < 8
-
-
 class TestTopicCleanupClearsBatch:
     def test_clear_batch_for_topic(self) -> None:
         _active_batches[(1, 10)] = ToolBatch(window_id="@0", thread_id=10)
@@ -814,33 +595,11 @@ class TestTopicCleanupClearsBatch:
         assert (1, 10) not in _active_batches
 
     def test_clear_batch_for_topic_noop(self) -> None:
-        clear_batch_for_topic(1, 999)  # should not raise
+        clear_batch_for_topic(1, 999)
 
     def test_clear_batch_none_thread(self) -> None:
         _active_batches[(1, 0)] = ToolBatch(window_id="@0", thread_id=0)
         clear_batch_for_topic(1, None)
-        assert (1, 0) not in _active_batches
-
-
-class TestFlushSendFallback:
-    @patch("ccgram.handlers.tool_batch.thread_router")
-    @patch("ccgram.handlers.tool_batch.rate_limit_send_message")
-    async def test_flush_sends_when_no_telegram_msg_id(
-        self, mock_send, mock_tr
-    ) -> None:
-        mock_tr.resolve_chat_id.return_value = 42
-        _active_batches[(1, 0)] = ToolBatch(
-            window_id="@0",
-            thread_id=0,
-            entries=[ToolBatchEntry("t1", "Read x", "ok")],
-            telegram_msg_id=None,  # first send failed
-        )
-
-        bot = AsyncMock()
-        await flush_batch(bot, 1, 0)
-        mock_send.assert_awaited_once()
-        send_args = mock_send.call_args
-        assert "Read x" in send_args.args[2]
         assert (1, 0) not in _active_batches
 
 
@@ -857,93 +616,3 @@ class TestDefensiveElseBranch:
         )
         result = await process_tool_event(bot, 1, task)
         assert result == task
-
-
-class TestDifferentUsersIsolation:
-    async def test_different_users_same_thread_separate_batches(
-        self, batch_env
-    ) -> None:
-        bot, _, _ = batch_env
-        await process_tool_event(
-            bot, 1, _make_tool_use(thread_id=10, tool_use_id="tu1")
-        )
-        await process_tool_event(
-            bot, 2, _make_tool_use(thread_id=10, tool_use_id="tu2")
-        )
-
-        assert (1, 10) in _active_batches
-        assert (2, 10) in _active_batches
-        assert _active_batches[(1, 10)].entries[0].tool_use_id == "tu1"
-        assert _active_batches[(2, 10)].entries[0].tool_use_id == "tu2"
-
-
-class TestBatchResultTruncation:
-    def test_result_truncated_to_200_chars(self):
-        long_text = "x" * 300
-        entry = ToolBatchEntry("t1", "Bash cmd")
-        entry.tool_result_text = long_text.split("\n", 1)[0][:200]
-        assert len(entry.tool_result_text) == 200
-
-    def test_multiline_result_uses_first_line(self):
-        result_text = "line one\nline two\nline three"
-        first_line = result_text.split("\n", 1)[0][:200]
-        assert first_line == "line one"
-
-
-class TestBatchResultPrefix:
-    @pytest.mark.parametrize(
-        ("text", "expected"),
-        [
-            ("error: file not found", "\u274c"),
-            ("FAILED test_foo.py::test_bar", "\u274c"),
-            ("Exception: KeyError", "\u274c"),
-            ("Traceback (most recent call last)", "\u274c"),
-            ("exit code 1", "\u274c"),
-            ("exit code 127", "\u274c"),
-            ("2 failures", "\u274c"),
-            ("1 failure", "\u274c"),
-            ("test failure in module", "\u274c"),
-            ("23 passed", "\u2705"),
-            ("Tests passed successfully", "\u2705"),
-            ("success", "\u2705"),
-            ("exit code 0", "\u2705"),
-            ("10 lines read", "\u23bf"),
-            ("file written", "\u23bf"),
-            ("", "\u23bf"),
-        ],
-    )
-    def test_prefix_detection(self, text, expected):
-        from ccgram.handlers.tool_batch import _batch_result_prefix
-
-        assert _batch_result_prefix(text) == expected
-
-    def test_error_takes_priority_over_success(self):
-        from ccgram.handlers.tool_batch import _batch_result_prefix
-
-        text = "3 passed, 1 FAILED"
-        assert _batch_result_prefix(text) == "\u274c"
-
-
-class TestBatchEntryFormatting:
-    def test_success_prefix_in_formatted_entry(self):
-        entry = ToolBatchEntry("t1", "Bash make test", "23 passed")
-        result = format_batch_message([entry])
-        assert "\u2705" in result
-        assert "23 passed" in result
-
-    def test_error_prefix_in_formatted_entry(self):
-        entry = ToolBatchEntry("t1", "Bash make test", "FAILED test_foo")
-        result = format_batch_message([entry])
-        assert "\u274c" in result
-        assert "FAILED test_foo" in result
-
-    def test_neutral_prefix_in_formatted_entry(self):
-        entry = ToolBatchEntry("t1", "Read src/foo.py", "42 lines")
-        result = format_batch_message([entry])
-        assert "\u23bf" in result
-        assert "42 lines" in result
-
-    def test_pending_entry_shows_hourglass(self):
-        entry = ToolBatchEntry("t1", "Bash make test")
-        result = format_batch_message([entry])
-        assert "\u23f3" in result

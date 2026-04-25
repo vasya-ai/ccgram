@@ -1,16 +1,18 @@
 import ast
 import inspect
+import os
 
 import pytest
 
 from ccgram.handlers.message_task import ContentTask
 from ccgram.handlers.tool_batch import (
-    BATCH_MAX_ENTRIES,
-    BATCH_MAX_LENGTH,
+    TELEGRAM_TEXT_LIMIT,
+    TOOL_BUBBLE_TITLE,
     ToolBatch,
     ToolBatchEntry,
     _batch_result_prefix,
     _extract_task_create_title,
+    _status_from_result_text,
     flush_if_active,
     format_batch_message,
     is_batch_eligible,
@@ -19,69 +21,103 @@ from ccgram.handlers.tool_batch import (
 
 
 class TestFormatBatchMessage:
-    def test_single_entry_pending(self) -> None:
-        entries = [ToolBatchEntry(tool_use_id="t1", tool_use_text="Read src/foo.py")]
-        result = format_batch_message(entries)
-        assert result.startswith("\u26a1 1 tool call")
-        assert "Read src/foo.py" in result
-        assert "\u23f3" in result
+    def test_pending_success_error_glyphs(self) -> None:
+        entries = [
+            ToolBatchEntry("t1", "Read src/foo.py", tool_name="Read"),
+            ToolBatchEntry("t2", "Bash make test", "23 passed", tool_name="Bash"),
+            ToolBatchEntry("t3", "Bash bad", "FAILED test_foo", tool_name="Bash"),
+        ]
 
-    def test_single_entry_with_result(self) -> None:
+        result = format_batch_message(entries)
+
+        assert result.startswith("```Tools\n")
+        assert '📖 Read: "src/foo.py" ↻' in result
+        assert '⚡ Bash: "make test" ✓' in result
+        assert '⚡ Bash: "bad" ❌' in result
+        assert "23 passed" not in result
+        assert "FAILED test_foo" not in result
+
+    def test_ccbot_style_markdown_summary(self) -> None:
+        entries = [
+            ToolBatchEntry("t1", "📖 **Read** `/tmp/a.py`"),
+            ToolBatchEntry("t2", "**Edit** `src/app.py`"),
+            ToolBatchEntry("t3", "**Bash** `npm test`"),
+        ]
+
+        result = format_batch_message(entries)
+
+        assert '📖 Read: "/tmp/a.py" ↻' in result
+        assert '✏️ Edit: "src/app.py" ↻' in result
+        assert '⚡ Bash: "npm test" ↻' in result
+
+    def test_home_path_abbreviation_and_one_line_summary(self) -> None:
+        home = os.path.expanduser("~")
+        entry = ToolBatchEntry("t1", f"Read {home}/project/file.py\nnext line")
+
+        result = format_batch_message([entry])
+
+        assert '~/project/file.py next line' in result
+        assert home not in result
+
+    def test_mcp_style_tool_uses_mcp_icon_and_short_name(self) -> None:
+        entry = ToolBatchEntry(
+            "t1",
+            "**mcp__codex_apps__github._fetch_pr** `openai/repo#12`",
+            tool_name="mcp__codex_apps__github._fetch_pr",
+        )
+
+        result = format_batch_message([entry])
+
+        assert '🔌 Fetch Pr: "openai/repo#12" ↻' in result
+
+    def test_provider_aware_title(self) -> None:
+        result = format_batch_message(
+            [ToolBatchEntry("t1", "Read x", tool_name="Read")],
+            provider_label="Codex",
+        )
+
+        assert result.startswith("```Codex Tools\n")
+
+    def test_below_limit_renders_all_tools(self) -> None:
+        entries = [
+            ToolBatchEntry(f"t{i}", f"Read file{i}.py", tool_name="Read")
+            for i in range(4)
+        ]
+
+        result = format_batch_message(entries)
+
+        assert "earlier tools" not in result
+        for i in range(4):
+            assert f'file{i}.py' in result
+        assert len(result) <= TELEGRAM_TEXT_LIMIT
+
+    def test_above_limit_hides_oldest_tools(self) -> None:
         entries = [
             ToolBatchEntry(
-                tool_use_id="t1",
-                tool_use_text="Read src/foo.py",
-                tool_result_text="42 lines",
+                f"t{i}",
+                f"Bash command-{i}-" + ("x" * 120),
+                tool_name="Bash",
             )
+            for i in range(80)
         ]
-        result = format_batch_message(entries)
-        assert "1 tool call" in result
-        assert "42 lines" in result
-        assert "\u23f3" not in result
 
-    def test_multiple_entries(self) -> None:
-        entries = [
-            ToolBatchEntry(tool_use_id="t1", tool_use_text="Read src/foo.py"),
-            ToolBatchEntry(tool_use_id="t2", tool_use_text="Edit src/bar.py"),
-            ToolBatchEntry(tool_use_id="t3", tool_use_text="Bash make test"),
-        ]
         result = format_batch_message(entries)
-        assert "3 tool calls" in result
 
-    def test_subagent_label_included(self) -> None:
-        entries = [ToolBatchEntry(tool_use_id="t1", tool_use_text="Read src/foo.py")]
-        result = format_batch_message(entries, subagent_label="\U0001f916 write-tests")
-        assert "\U0001f916 write-tests" in result
+        assert len(result) <= TELEGRAM_TEXT_LIMIT
+        assert "earlier tools" in result
+        assert "command-79" in result
+        assert "command-0" not in result
 
-    def test_task_create_batch_renders_numbered_list(self) -> None:
-        entries = [
-            ToolBatchEntry(
-                tool_use_id="t1",
-                tool_use_text="**TaskCreate** `Build the widget`",
-                tool_name="TaskCreate",
-            ),
-            ToolBatchEntry(
-                tool_use_id="t2",
-                tool_use_text="**TaskCreate** `Test the widget`",
-                tool_name="TaskCreate",
-            ),
-        ]
-        result = format_batch_message(entries)
-        assert "Creating 2 tasks" in result
-        assert "1. Build the widget" in result
-        assert "2. Test the widget" in result
+    def test_pathological_single_entry_is_truncated_not_split(self) -> None:
+        entry = ToolBatchEntry("t1", "Bash short", tool_name="Bash")
+        entry.summary = "x" * (TELEGRAM_TEXT_LIMIT * 2)
 
-    def test_task_create_batch_completed(self) -> None:
-        entries = [
-            ToolBatchEntry(
-                tool_use_id="t1",
-                tool_use_text="**TaskCreate** `Build the widget`",
-                tool_name="TaskCreate",
-                tool_result_text="ok",
-            ),
-        ]
-        result = format_batch_message(entries)
-        assert "Created 1 task" in result
+        result = format_batch_message([entry])
+
+        assert len(result) <= TELEGRAM_TEXT_LIMIT
+        assert result.count("```") == 2
+        assert result.endswith("```")
+        assert "…" in result
 
 
 class TestExtractTaskCreateTitle:
@@ -98,13 +134,6 @@ class TestExtractTaskCreateTitle:
             tool_use_text="TaskCreate Build the widget",
         )
         assert _extract_task_create_title(entry) == "Build the widget"
-
-    def test_fallback_raw_text(self) -> None:
-        entry = ToolBatchEntry(
-            tool_use_id="t1",
-            tool_use_text="something else entirely",
-        )
-        assert _extract_task_create_title(entry) == "something else entirely"
 
     def test_empty_text(self) -> None:
         entry = ToolBatchEntry(tool_use_id="t1", tool_use_text="")
@@ -141,12 +170,12 @@ class TestIsBatchEligible:
         task = self._make_task(content_type=content_type)
         assert is_batch_eligible(task) is False
 
-    def test_not_eligible_when_batch_mode_disabled(
+    def test_not_eligible_when_batch_mode_verbose(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from ccgram.handlers import tool_batch
 
-        monkeypatch.setattr(tool_batch, "get_batch_mode", lambda _wid: "individual")
+        monkeypatch.setattr(tool_batch, "get_batch_mode", lambda _wid: "verbose")
         task = self._make_task(content_type="tool_use")
         assert is_batch_eligible(task) is False
 
@@ -165,21 +194,32 @@ class TestIsBatchEligible:
         assert captured == ["@7"]
 
 
-class TestBatchResultPrefix:
+class TestBatchResultStatus:
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("All tests passed", "success"),
+            ("success", "success"),
+            ("exit code 0", "success"),
+            ("error: file not found", "error"),
+            ("FAILED test_foo", "error"),
+            ("exit code 1", "error"),
+            ("⏹ Interrupted", "error"),
+        ],
+    )
+    def test_status_selection(self, text: str, expected: str) -> None:
+        assert _status_from_result_text(text) == expected
+
     @pytest.mark.parametrize(
         "text,expected",
         [
             ("All tests passed", "\u2705"),
-            ("success", "\u2705"),
-            ("exit code 0", "\u2705"),
             ("error: file not found", "\u274c"),
-            ("FAILED test_foo", "\u274c"),
-            ("exit code 1", "\u274c"),
+            ("⏹ Interrupted", "\u274c"),
             ("42 lines", "\u23bf"),
-            ("ok", "\u23bf"),
         ],
     )
-    def test_prefix_selection(self, text: str, expected: str) -> None:
+    def test_legacy_prefix_selection(self, text: str, expected: str) -> None:
         assert _batch_result_prefix(text) == expected
 
 
@@ -187,7 +227,14 @@ class TestBatchDataStructures:
     def test_tool_batch_entry_defaults(self) -> None:
         entry = ToolBatchEntry(tool_use_id="t1", tool_use_text="Read foo.py")
         assert entry.tool_result_text is None
-        assert entry.tool_name is None
+        assert entry.tool_name == "Read"
+        assert entry.summary == "foo.py"
+        assert entry.status == "pending"
+
+    def test_tool_batch_entry_result_sets_status(self) -> None:
+        entry = ToolBatchEntry("t1", "Bash make test", "exit code 1")
+        assert entry.status == "error"
+        assert entry.result_text == "exit code 1"
 
     def test_tool_batch_defaults(self) -> None:
         batch = ToolBatch(window_id="@0", thread_id=42)
@@ -196,8 +243,8 @@ class TestBatchDataStructures:
         assert batch.total_length == 0
 
     def test_constants(self) -> None:
-        assert BATCH_MAX_ENTRIES == 9
-        assert BATCH_MAX_LENGTH == 2800
+        assert TOOL_BUBBLE_TITLE == "Tools"
+        assert TELEGRAM_TEXT_LIMIT == 4096
 
 
 class TestProcessToolEventSignature:
