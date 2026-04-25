@@ -264,7 +264,7 @@ class TestCodexTranscriptParsing:
                 "type": "event_msg",
                 "payload": {
                     "type": "task_complete",
-                    "last_agent_message": "finished",
+                    "last_agent_message": "finished\n\npartial",
                 },
             },
         ]
@@ -272,6 +272,34 @@ class TestCodexTranscriptParsing:
         assert len(messages) == 1
         assert messages[0].text == response_text
         assert messages[0].phase == "final_answer"
+
+    def test_skips_later_task_complete_after_response_item_final(self) -> None:
+        codex = CodexProvider()
+        first_entries = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "finished full"}],
+                },
+            }
+        ]
+        messages, pending = codex.parse_transcript_entries(first_entries, {})
+        assert len(messages) == 1
+
+        second_entries = [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "last_agent_message": "finished",
+                },
+            }
+        ]
+        messages, pending = codex.parse_transcript_entries(second_entries, pending)
+        assert messages == []
 
     def test_tracks_function_call_pending(self) -> None:
         codex = CodexProvider()

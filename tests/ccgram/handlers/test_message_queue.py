@@ -295,6 +295,23 @@ class TestDispatch:
     )
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
     @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=False)
+    async def test_truncated_final_prefix_is_suppressed(
+        self, mock_eligible, mock_flush, mock_process, bot, queue, lock
+    ):
+        full = _content_task("done\n\nmore details", phase="final_answer")
+        truncated = _content_task("done", phase="final_answer")
+
+        await _dispatch(bot, 1, full, queue, lock)
+        await _dispatch(bot, 1, truncated, queue, lock)
+
+        assert mock_flush.await_count == 2
+        mock_process.assert_awaited_once_with(bot, 1, full)
+
+    @patch(
+        "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
+    )
+    @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
+    @patch("ccgram.handlers.message_queue.is_batch_eligible", return_value=False)
     async def test_user_message_flushes_active_batch(
         self, mock_eligible, mock_flush, mock_process, bot, queue, lock
     ):

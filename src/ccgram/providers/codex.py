@@ -516,10 +516,7 @@ def _parse_event_message(
         text = payload.get("last_agent_message", "")
         if not isinstance(text, str) or not text:
             return [], pending
-        normalized = _normalize_final_text(text)
-        if normalized in (known_final_texts or set()):
-            return [], pending
-        if last_final_response_text and normalized == last_final_response_text:
+        if known_final_texts or last_final_response_text:
             return [], pending
         return (
             [

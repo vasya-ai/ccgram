@@ -170,7 +170,7 @@ def _is_recent_duplicate_final(user_id: int, task: ContentTask) -> bool:
     now = time.monotonic()
     _prune_recent_final_sends(now)
     previous = _recent_final_sends.get(_final_content_key(user_id, task))
-    return previous is not None and previous[1] == signature
+    return previous is not None and previous[1].startswith(signature)
 
 
 def _remember_final_send(user_id: int, task: ContentTask) -> None:
