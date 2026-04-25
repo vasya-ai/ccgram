@@ -127,6 +127,18 @@ class TestConvertToEntities:
         assert len(link_entities) == 1
         assert link_entities[0].url == "https://example.com"
 
+    def test_local_file_link_is_plain_text(self) -> None:
+        text, entities = convert_to_entities(
+            "[window_tick.py:74](/home/aiagent/projects/ccgram/src/window_tick.py:74)"
+        )
+        assert text == "window_tick.py:74"
+        assert [e for e in entities if e.type == MessageEntity.TEXT_LINK] == []
+
+    def test_relative_link_is_plain_text(self) -> None:
+        text, entities = convert_to_entities("[README](docs/README.md)")
+        assert text == "README"
+        assert [e for e in entities if e.type == MessageEntity.TEXT_LINK] == []
+
     def test_empty_text(self) -> None:
         text, entities = convert_to_entities("")
         assert text == ""

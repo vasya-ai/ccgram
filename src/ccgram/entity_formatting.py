@@ -8,6 +8,7 @@ Key function: convert_to_entities(text) → (str, list[MessageEntity]).
 """
 
 import re
+from urllib.parse import urlparse
 
 from telegram import MessageEntity as TelegramEntity
 
@@ -36,6 +37,7 @@ _MIN_PARTIAL_LINE_LEN = 20
 _FENCE_RE = re.compile(r"^(`{3,}|~{3,})", re.MULTILINE)
 _INDENTED_CODE_RE = re.compile(r"(?<=\n\n)((?:    .+\n?)+)")
 _INDENTED_LINE_RE = re.compile(r"^    ", re.MULTILINE)
+_VALID_TEXT_LINK_SCHEMES = {"http", "https", "tg", "mailto"}
 
 
 def _strip_indented_code_blocks(text: str) -> str:
@@ -96,8 +98,26 @@ def _deindent(text: str, is_start: bool) -> str:
     )
 
 
-def _lib_entity_to_telegram(ent: _LibEntity, offset_shift: int = 0) -> TelegramEntity:
+def _is_valid_text_link_url(url: str | None) -> bool:
+    """Return True when Telegram accepts the URL for a text_link entity."""
+    if not url:
+        return False
+
+    parsed = urlparse(url)
+    if parsed.scheme not in _VALID_TEXT_LINK_SCHEMES:
+        return False
+    if parsed.scheme in {"http", "https", "tg"}:
+        return bool(parsed.netloc)
+    return True
+
+
+def _lib_entity_to_telegram(
+    ent: _LibEntity,
+    offset_shift: int = 0,
+) -> TelegramEntity | None:
     """Convert a telegramify_markdown MessageEntity to telegram.MessageEntity."""
+    if ent.type == TelegramEntity.TEXT_LINK and not _is_valid_text_link_url(ent.url):
+        return None
     return TelegramEntity(
         type=ent.type,
         offset=ent.offset + offset_shift,
@@ -112,7 +132,11 @@ def _convert_segment(text: str) -> tuple[str, list[TelegramEntity]]:
     """Convert a markdown segment (no expandable quote sentinels) to entities."""
     preprocessed = _strip_indented_code_blocks(text)
     plain, lib_entities = _tm_convert(preprocessed)
-    tg_entities = [_lib_entity_to_telegram(e) for e in lib_entities]
+    tg_entities = [
+        entity
+        for e in lib_entities
+        if (entity := _lib_entity_to_telegram(e)) is not None
+    ]
     return plain, tg_entities
 
 
