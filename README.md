@@ -239,6 +239,7 @@ Open your Telegram group, create a new topic, send a message — a directory bro
 | `CCGRAM_PROVIDER`           | `claude`          | Default provider (`claude`, `codex`, `gemini`, `pi`, `shell`) |
 | `CCGRAM_<NAME>_COMMAND`     | _(from provider)_ | Override launch command per provider                          |
 | `CCGRAM_GROUP_ID`           | _(all groups)_    | Restrict to one Telegram group                                |
+| `CCGRAM_SHOW_IDLE_READY_STATUS` | `true`        | Show `✓ Ready` status bubble when a window becomes idle        |
 | `CCGRAM_LLM_PROVIDER`       | _(disabled)_      | LLM for shell command generation + completion summaries       |
 | `CCGRAM_LLM_API_KEY`        | _(empty)_         | LLM API key (env only)                                        |
 | `CCGRAM_WHISPER_PROVIDER`   | _(disabled)_      | Whisper provider for voice transcription (`openai`, `groq`)   |

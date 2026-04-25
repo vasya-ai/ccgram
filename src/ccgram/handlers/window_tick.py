@@ -18,6 +18,7 @@ from telegram.constants import ChatAction
 from telegram.error import BadRequest, TelegramError
 
 from ..claude_task_state import claude_task_state
+from ..config import config
 from ..providers import get_provider_for_window
 from ..providers.base import StatusUpdate
 from .. import window_query
@@ -113,7 +114,7 @@ async def _transition_to_idle(
     await update_topic_emoji(bot, chat_id, thread_id, "idle", display)
     lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
     lifecycle_strategy.clear_typing_state(user_id, thread_id)
-    if notif_mode not in ("muted", "errors_only"):
+    if config.show_idle_ready_status and notif_mode not in ("muted", "errors_only"):
         from .callback_data import IDLE_STATUS_TEXT
 
         await enqueue_status_update(

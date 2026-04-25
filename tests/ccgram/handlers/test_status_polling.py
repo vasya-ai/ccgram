@@ -600,15 +600,30 @@ class TestTransitionToIdle:
 
         bot = AsyncMock(spec=Bot)
         with (
+            patch("ccgram.handlers.window_tick.config") as mock_config,
             patch("ccgram.handlers.window_tick.update_topic_emoji"),
             patch("ccgram.handlers.window_tick.enqueue_status_update") as mock_enqueue,
             patch("ccgram.handlers.window_tick.time") as mock_time,
         ):
+            mock_config.show_idle_ready_status = True
             mock_time.monotonic.return_value = 100.0
             await _transition_to_idle(bot, 1, "@0", 42, -100, "project", "normal")
         mock_enqueue.assert_called_once()
         assert mock_enqueue.call_args[0][3] == IDLE_STATUS_TEXT
         assert mock_enqueue.call_args[1]["thread_id"] == 42
+
+    async def test_disabled_ready_status_clears_status(self) -> None:
+        from ccgram.handlers.window_tick import _transition_to_idle
+
+        bot = AsyncMock(spec=Bot)
+        with (
+            patch("ccgram.handlers.window_tick.config") as mock_config,
+            patch("ccgram.handlers.window_tick.update_topic_emoji"),
+            patch("ccgram.handlers.window_tick.enqueue_status_update") as mock_enqueue,
+        ):
+            mock_config.show_idle_ready_status = False
+            await _transition_to_idle(bot, 1, "@0", 42, -100, "project", "normal")
+        mock_enqueue.assert_called_once_with(bot, 1, "@0", None, thread_id=42)
 
     @pytest.mark.parametrize("mode", ["muted", "errors_only"])
     async def test_suppressed_mode_clears_status_no_timer(self, mode: str) -> None:

@@ -117,6 +117,7 @@ All settings accept both CLI flags and environment variables. CLI flags take pre
 | `CCGRAM_<NAME>_COMMAND`                              | _(from provider)_    | Per-provider launch command (env only, see below)                   |
 | `CCGRAM_PROMPT_MODE` / `--prompt-mode`               | `wrap`               | Shell prompt marker mode (`wrap` or `replace`)                      |
 | `CCGRAM_SHOW_HIDDEN_DIRS` / `--show-hidden-dirs`     | `false`              | Show dot-directories in directory browser                           |
+| `CCGRAM_SHOW_IDLE_READY_STATUS`                      | `true`               | Show `✓ Ready` status bubble when a window becomes idle              |
 | `CCGRAM_GROUP_ID` / `--group-id`                     | _(all groups)_       | Restrict to one Telegram group                                      |
 | `CCGRAM_INSTANCE_NAME` / `--instance-name`           | hostname             | Display label for this instance                                     |
 | `CCGRAM_LOG_LEVEL` / `--log-level`                   | `INFO`               | Logging level (DEBUG, INFO, WARNING, ERROR)                         |

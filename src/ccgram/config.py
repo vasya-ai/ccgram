@@ -43,6 +43,14 @@ def _parse_int_env(name: str, default: int) -> int:
         raise ValueError(f"{name} must be a valid integer: {exc}") from exc
 
 
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var using the project's standard truthy values."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.lower() in ("1", "true", "yes")
+
+
 def _resolve_toolbar_path() -> str:
     """Resolve the toolbar TOML config path: env var → ~/.ccgram → empty.
 
@@ -120,6 +128,9 @@ class Config:
         )
         self.status_poll_interval = max(
             0.5, float(os.getenv("CCGRAM_STATUS_POLL_INTERVAL", "1.0"))
+        )
+        self.show_idle_ready_status = _parse_bool_env(
+            "CCGRAM_SHOW_IDLE_READY_STATUS", True
         )
 
         # Multi-instance support

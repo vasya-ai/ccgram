@@ -11,6 +11,14 @@ def _base_env(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test:token")
     monkeypatch.setenv("ALLOWED_USERS", "12345")
     monkeypatch.setenv("CCGRAM_DIR", str(tmp_path))
+    for name in (
+        "CCGRAM_GROUP_ID",
+        "CCBOT_GROUP_ID",
+        "CCGRAM_SHOW_HIDDEN_DIRS",
+        "CCBOT_SHOW_HIDDEN_DIRS",
+        "CCGRAM_SHOW_IDLE_READY_STATUS",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.mark.usefixtures("_base_env")
@@ -119,6 +127,25 @@ class TestShowHiddenDirs:
         monkeypatch.setenv("CCGRAM_SHOW_HIDDEN_DIRS", value)
         cfg = Config()
         assert cfg.show_hidden_dirs is True
+
+
+@pytest.mark.usefixtures("_base_env")
+class TestShowIdleReadyStatus:
+    def test_show_idle_ready_status_default_true(self):
+        cfg = Config()
+        assert cfg.show_idle_ready_status is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "False", "NO"])
+    def test_show_idle_ready_status_disabled(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_SHOW_IDLE_READY_STATUS", value)
+        cfg = Config()
+        assert cfg.show_idle_ready_status is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "True", "YES"])
+    def test_show_idle_ready_status_enabled(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_SHOW_IDLE_READY_STATUS", value)
+        cfg = Config()
+        assert cfg.show_idle_ready_status is True
 
 
 @pytest.mark.usefixtures("_base_env")

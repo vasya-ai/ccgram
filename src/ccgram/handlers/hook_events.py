@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable
 from telegram import Bot
 
 from ..claude_task_state import classify_wait_message, claude_task_state
+from ..config import config
 from ..providers.base import HookEvent
 from ..window_query import view_window
 from ..session_lifecycle import session_lifecycle
@@ -168,7 +169,7 @@ async def _handle_stop(event: HookEvent, bot: Bot) -> None:
 
     for user_id, thread_id, window_id in users:
         session_lifecycle.handle_stop_task_state(window_id)
-        if notif_mode in ("muted", "errors_only"):
+        if notif_mode in ("muted", "errors_only") or not config.show_idle_ready_status:
             status_text = None
         else:
             status_text = claude_task_state.format_completion_text(

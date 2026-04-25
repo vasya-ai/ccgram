@@ -141,9 +141,11 @@ class TestHandleStop:
         )
         bot = AsyncMock(spec=Bot)
         with (
+            patch("ccgram.handlers.hook_events.config") as mock_config,
             patch("ccgram.handlers.hook_events.update_topic_emoji") as mock_emoji,
             patch("ccgram.handlers.hook_events.enqueue_status_update") as mock_enqueue,
         ):
+            mock_config.show_idle_ready_status = True
             event = _make_event(event_type="Stop", data={"stop_reason": "done"})
             await dispatch_hook_event(event, bot)
 
@@ -175,6 +177,26 @@ class TestHandleStop:
             mock_emoji.assert_not_called()
             mock_enqueue.assert_called_once_with(bot, 100, "@0", None, thread_id=42)
 
+    async def test_stop_respects_disabled_ready_status(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "ccgram.handlers.hook_events.thread_router.iter_thread_bindings",
+            lambda: iter([(100, 42, "@0")]),
+        )
+        bot = AsyncMock(spec=Bot)
+        view_stub = MagicMock(notification_mode="all", transcript_path=None)
+        with (
+            patch("ccgram.handlers.hook_events.config") as mock_config,
+            patch("ccgram.handlers.hook_events.view_window", return_value=view_stub),
+            patch("ccgram.handlers.hook_events.update_topic_emoji") as mock_emoji,
+            patch("ccgram.handlers.hook_events.enqueue_status_update") as mock_enqueue,
+        ):
+            mock_config.show_idle_ready_status = False
+            event = _make_event(event_type="Stop", data={"stop_reason": "done"})
+            await dispatch_hook_event(event, bot)
+
+            mock_emoji.assert_not_called()
+            mock_enqueue.assert_called_once_with(bot, 100, "@0", None, thread_id=42)
+
     async def test_stop_no_users_skips(self, monkeypatch) -> None:
         monkeypatch.setattr(
             "ccgram.handlers.hook_events.thread_router.iter_thread_bindings",
@@ -197,6 +219,7 @@ class TestEnhanceWithLlmSummary:
         mock_state.transcript_path = "/tmp/transcript.jsonl"
         bot = AsyncMock(spec=Bot)
         with (
+            patch("ccgram.handlers.hook_events.config") as mock_config,
             patch(
                 "ccgram.handlers.hook_events.view_window",
                 return_value=mock_state,
@@ -208,6 +231,7 @@ class TestEnhanceWithLlmSummary:
                 return_value="Fixed auth bug, all 5 tests pass",
             ),
         ):
+            mock_config.show_idle_ready_status = True
             event = _make_event(
                 event_type="Stop",
                 data={"stop_reason": "done", "num_turns": 3},
