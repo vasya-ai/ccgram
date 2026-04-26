@@ -27,9 +27,22 @@ _CTX = "ccgram.handlers.shell_context"
 
 
 @pytest.fixture(autouse=True)
-def _clean_shell_state():
+def _clean_shell_state(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+):
     _shell_pending.clear()
     _generation_counter.clear()
+    if "TestLazyMarkerRecovery" not in request.node.nodeid:
+        monkeypatch.setattr(
+            f"{_MOD}._ensure_prompt_marker",
+            AsyncMock(),
+        )
+    if "TestCancelStuckInput" not in request.node.nodeid:
+        monkeypatch.setattr(
+            f"{_MOD}._cancel_stuck_input",
+            AsyncMock(),
+        )
     yield
     _shell_pending.clear()
     _generation_counter.clear()
@@ -256,16 +269,20 @@ class TestHandleShellMessage:
         with (
             patch(f"{_MOD}.enqueue_status_update", new_callable=AsyncMock),
             patch(f"{_MOD}.lifecycle_strategy.clear_probe_failures"),
-            patch(f"{_CTX}.view_window") as mock_sm,
+            patch(f"{_CTX}.view_window"),
             patch(f"{_MOD}.thread_router") as mock_tr,
             patch(f"{_MOD}.safe_send", new_callable=AsyncMock) as mock_send,
+            patch(
+                f"{_MOD}.send_to_window",
+                new_callable=AsyncMock,
+                return_value=(False, "Window not found"),
+            ),
             patch(
                 "ccgram.providers.shell.has_prompt_marker",
                 new_callable=AsyncMock,
                 return_value=True,
             ),
         ):
-            mock_sm.send_to_window = AsyncMock(return_value=(False, "Window not found"))
             mock_tr.resolve_chat_id.return_value = -100
 
             await handle_shell_message(bot, 1, 42, "@0", "!ls", message)
@@ -662,15 +679,19 @@ class TestLazyMarkerRecovery:
         with (
             patch(f"{_MOD}.enqueue_status_update", new_callable=AsyncMock),
             patch(f"{_MOD}.lifecycle_strategy.clear_probe_failures"),
-            patch(f"{_CTX}.view_window") as mock_sm,
+            patch(f"{_CTX}.view_window"),
             patch(f"{_MOD}.tmux_manager") as mock_tm,
+            patch(
+                f"{_MOD}.send_to_window",
+                new_callable=AsyncMock,
+                return_value=(True, ""),
+            ),
             patch("ccgram.handlers.shell_capture.mark_telegram_command"),
             patch(
                 "ccgram.handlers.shell_prompt_orchestrator.ensure_setup",
                 new_callable=AsyncMock,
             ) as mock_ensure,
         ):
-            mock_sm.send_to_window = AsyncMock(return_value=(True, ""))
             mock_tm.find_window_by_id = AsyncMock(return_value=None)
             mock_tm.capture_pane = AsyncMock(return_value=None)
             await handle_shell_message(bot, 1, 42, "@0", "!ls", message)

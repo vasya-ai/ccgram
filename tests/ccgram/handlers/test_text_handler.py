@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ccgram.agent_input_delivery import UserSubmitResult, UserSubmitStatus
 from ccgram.handlers.text_handler import (
     _check_ui_guards,
     _forward_message,
@@ -21,6 +22,10 @@ from ccgram.handlers.user_state import (
 )
 
 _TH = "ccgram.handlers.text_handler"
+
+
+def _submit_result(status: UserSubmitStatus, message: str = "ok") -> UserSubmitResult:
+    return UserSubmitResult(status, message, attempts=1)
 
 
 class TestCheckUiGuards:
@@ -306,8 +311,6 @@ class TestShellProviderRouting:
         mock_get_provider: MagicMock,
     ) -> None:
         mock_tr.get_window_for_thread.return_value = "@0"
-        mock_sm.send_to_window = AsyncMock(return_value=(True, ""))
-
         provider = MagicMock()
         provider.capabilities.name = "claude"
         mock_get_provider.return_value = provider
@@ -318,6 +321,11 @@ class TestShellProviderRouting:
                 new_callable=AsyncMock,
             ) as mock_shell,
             patch(f"{_TH}.get_interactive_window", return_value=None),
+            patch(
+                f"{_TH}.submit_user_message",
+                new_callable=AsyncMock,
+                return_value=_submit_result(UserSubmitStatus.ACCEPTED),
+            ),
         ):
             from ccgram.handlers.text_handler import handle_text_message
 
@@ -340,7 +348,11 @@ class TestShellProviderRouting:
 
 
 class TestForwardMessage:
-    @patch(f"{_TH}.send_to_window", new_callable=AsyncMock, return_value=(True, "ok"))
+    @patch(
+        f"{_TH}.submit_user_message",
+        new_callable=AsyncMock,
+        return_value=_submit_result(UserSubmitStatus.ACCEPTED),
+    )
     @patch(f"{_TH}.window_query")
     async def test_sends_to_window(
         self, mock_sm: MagicMock, mock_send: AsyncMock
@@ -355,9 +367,12 @@ class TestForwardMessage:
 
     @patch(f"{_TH}.safe_reply", new_callable=AsyncMock)
     @patch(
-        f"{_TH}.send_to_window",
+        f"{_TH}.submit_user_message",
         new_callable=AsyncMock,
-        return_value=(False, "Window not found"),
+        return_value=_submit_result(
+            UserSubmitStatus.WINDOW_MISSING,
+            "Window not found",
+        ),
     )
     @patch(f"{_TH}.window_query")
     async def test_send_failure_replies_error(
@@ -371,9 +386,37 @@ class TestForwardMessage:
         mock_reply.assert_called_once()
         assert "Window not found" in mock_reply.call_args.args[1]
 
+    @patch(f"{_TH}.ack_reaction", new_callable=AsyncMock)
+    @patch(f"{_TH}.safe_reply", new_callable=AsyncMock)
+    @patch(
+        f"{_TH}.submit_user_message",
+        new_callable=AsyncMock,
+        return_value=_submit_result(
+            UserSubmitStatus.ACK_TIMEOUT,
+            "Message not accepted",
+        ),
+    )
+    async def test_does_not_ack_failed_submit(
+        self,
+        _mock_send: AsyncMock,
+        mock_reply: AsyncMock,
+        mock_ack: AsyncMock,
+    ) -> None:
+        bot = AsyncMock()
+        message = AsyncMock()
+
+        await _forward_message("@0", 100, 42, "hello", bot, message)
+
+        mock_reply.assert_called_once()
+        mock_ack.assert_not_called()
+
     @patch(f"{_TH}.get_interactive_window", return_value=None)
     @patch(f"{_TH}._capture_bash_output")
-    @patch(f"{_TH}.send_to_window", new_callable=AsyncMock, return_value=(True, "ok"))
+    @patch(
+        f"{_TH}.submit_user_message",
+        new_callable=AsyncMock,
+        return_value=_submit_result(UserSubmitStatus.ACCEPTED),
+    )
     @patch(f"{_TH}.window_query")
     async def test_bash_capture_for_bang_command(
         self,
@@ -397,7 +440,11 @@ class TestForwardMessage:
             await task
 
     @patch(f"{_TH}.get_interactive_window", return_value=None)
-    @patch(f"{_TH}.send_to_window", new_callable=AsyncMock, return_value=(True, "ok"))
+    @patch(
+        f"{_TH}.submit_user_message",
+        new_callable=AsyncMock,
+        return_value=_submit_result(UserSubmitStatus.ACCEPTED),
+    )
     @patch(f"{_TH}.window_query")
     async def test_cancels_existing_bash_capture(
         self, mock_sm: MagicMock, _mock_send: AsyncMock, _mock_interactive: MagicMock
@@ -418,7 +465,11 @@ class TestForwardMessage:
 
     @patch(f"{_TH}.handle_interactive_ui", new_callable=AsyncMock)
     @patch(f"{_TH}.get_interactive_window", return_value="@0")
-    @patch(f"{_TH}.send_to_window", new_callable=AsyncMock, return_value=(True, "ok"))
+    @patch(
+        f"{_TH}.submit_user_message",
+        new_callable=AsyncMock,
+        return_value=_submit_result(UserSubmitStatus.ACCEPTED),
+    )
     @patch(f"{_TH}.window_query")
     async def test_refreshes_interactive_ui(
         self,

@@ -17,7 +17,11 @@ from ccgram.tmux_manager import (
 
 
 @pytest.fixture(autouse=True)
-def _reset():
+def _reset(monkeypatch: pytest.MonkeyPatch):
+    async def to_thread_inline(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("ccgram.tmux_manager.asyncio.to_thread", to_thread_inline)
     reset_vim_state()
     yield
     reset_vim_state()

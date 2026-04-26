@@ -656,6 +656,44 @@ class TmuxManager:
             self._pane_send, window_id, "BSpace", enter=False, literal=False
         )
 
+    def input_lock(self, window_id: str) -> asyncio.Lock:
+        """Return the per-window input lock used for serialized key injection."""
+        return _vim_locks.setdefault(window_id, asyncio.Lock())
+
+    async def _insert_literal_text_locked(self, window_id: str, text: str) -> bool:
+        """Insert literal text into a TUI composer.
+
+        Caller must hold ``input_lock(window_id)``. This intentionally preserves
+        the historical ``!`` command-mode handling used by send_keys().
+        """
+        await self._ensure_vim_insert_mode(window_id)
+
+        if text.startswith("!"):
+            if not await asyncio.to_thread(
+                self._pane_send, window_id, "!", enter=False, literal=True
+            ):
+                return False
+            rest = text[1:]
+            if rest:
+                await asyncio.sleep(1.0)
+                return await asyncio.to_thread(
+                    self._pane_send, window_id, rest, enter=False, literal=True
+                )
+            return True
+
+        return await asyncio.to_thread(
+            self._pane_send, window_id, text, enter=False, literal=True
+        )
+
+    async def _submit_enter_locked(self, window_id: str) -> bool:
+        """Submit the active TUI composer with Enter.
+
+        Caller must hold ``input_lock(window_id)``.
+        """
+        return await asyncio.to_thread(
+            self._pane_send, window_id, "", enter=True, literal=False
+        )
+
     async def _send_literal_then_enter(self, window_id: str, text: str) -> bool:
         """Send literal text followed by Enter with a delay.
 
@@ -670,35 +708,15 @@ class TmuxManager:
         Handles ``!`` command mode: sends ``!`` first so the TUI switches
         to bash mode, waits 1s, then sends the rest.
         """
-        lock = _vim_locks.setdefault(window_id, asyncio.Lock())
-        async with lock:
+        async with self.input_lock(window_id):
             return await self._send_literal_then_enter_locked(window_id, text)
 
     async def _send_literal_then_enter_locked(self, window_id: str, text: str) -> bool:
         """Inner send implementation (must be called under per-window lock)."""
-        await self._ensure_vim_insert_mode(window_id)
-
-        if text.startswith("!"):
-            if not await asyncio.to_thread(
-                self._pane_send, window_id, "!", enter=False, literal=True
-            ):
-                return False
-            rest = text[1:]
-            if rest:
-                await asyncio.sleep(1.0)
-                if not await asyncio.to_thread(
-                    self._pane_send, window_id, rest, enter=False, literal=True
-                ):
-                    return False
-        else:
-            if not await asyncio.to_thread(
-                self._pane_send, window_id, text, enter=False, literal=True
-            ):
-                return False
+        if not await self._insert_literal_text_locked(window_id, text):
+            return False
         await asyncio.sleep(0.5)
-        return await asyncio.to_thread(
-            self._pane_send, window_id, "", enter=True, literal=False
-        )
+        return await self._submit_enter_locked(window_id)
 
     async def send_keys(
         self,

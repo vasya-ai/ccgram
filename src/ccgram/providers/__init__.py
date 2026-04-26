@@ -32,6 +32,14 @@ _YOLO_FLAGS: dict[str, str] = {
     "codex": "--dangerously-bypass-approvals-and-sandbox",
     "gemini": "--yolo",
 }
+_CODEX_DISABLE_PASTE_BURST_CONFIG = "-c disable_paste_burst=true"
+
+
+def _harden_codex_launch_command(command: str) -> str:
+    """Disable Codex TUI paste-burst mode for CCGram-managed text injection."""
+    if "disable_paste_burst" in command:
+        return command
+    return f"{command} {_CODEX_DISABLE_PASTE_BURST_CONFIG}"
 
 
 def has_yolo_mode(provider_name: str) -> bool:
@@ -259,6 +267,8 @@ def resolve_launch_command(
         from ccgram.providers.gemini import build_hardened_gemini_launch_command
 
         command = build_hardened_gemini_launch_command(command)
+    elif provider == "codex" and not override:
+        command = _harden_codex_launch_command(command)
 
     if approval_mode.lower() != _APPROVAL_MODE_YOLO:
         return command

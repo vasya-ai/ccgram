@@ -42,8 +42,9 @@ from ..topic_state_registry import topic_state
 from .user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT, RECOVERY_WINDOW_ID
 from .. import window_query
 from ..thread_router import thread_router
+from ..agent_input_delivery import UserSubmitStatus, submit_user_message
 from ..providers import get_provider_for_window
-from ..tmux_manager import send_to_window, tmux_manager
+from ..tmux_manager import tmux_manager
 from ..utils import handle_general_topic_message, is_general_topic, task_done_callback
 
 logger = structlog.get_logger()
@@ -325,10 +326,18 @@ async def _forward_message(
 
     lifecycle_strategy.clear_probe_failures(window_id)
 
-    success, err_message = await send_to_window(window_id, text)
-    if not success:
-        await safe_reply(message, f"\u274c {err_message}")
+    submit_result = await submit_user_message(window_id, text)
+    if not submit_result.ok:
+        await safe_reply(message, f"\u274c {submit_result.message}")
         return
+    if submit_result.status == UserSubmitStatus.INJECTED_UNVERIFIED:
+        logger.debug(
+            "Forwarded message without transcript verification",
+            window_id=window_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            attempts=submit_result.attempts,
+        )
 
     await ack_reaction(bot, message.chat.id, message.message_id)
 

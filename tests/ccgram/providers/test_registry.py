@@ -93,7 +93,10 @@ class TestResolveLaunchCommand:
         from ccgram.providers import resolve_launch_command
 
         assert resolve_launch_command("claude") == "claude"
-        assert resolve_launch_command("codex") == "codex"
+        assert (
+            resolve_launch_command("codex")
+            == "codex -c disable_paste_burst=true"
+        )
         gemini_cmd = resolve_launch_command("gemini")
         assert "GEMINI_CLI_SYSTEM_SETTINGS_PATH=" in gemini_cmd
         assert gemini_cmd.endswith(" gemini")
@@ -103,7 +106,10 @@ class TestResolveLaunchCommand:
 
         monkeypatch.setenv("CCGRAM_CLAUDE_COMMAND", "ce --current")
         assert resolve_launch_command("claude") == "ce --current"
-        assert resolve_launch_command("codex") == "codex"
+        assert (
+            resolve_launch_command("codex")
+            == "codex -c disable_paste_burst=true"
+        )
 
     def test_override_does_not_affect_other_providers(self, monkeypatch) -> None:
         from ccgram.providers import resolve_launch_command
@@ -139,7 +145,8 @@ class TestResolveLaunchCommand:
         )
         assert (
             resolve_launch_command("codex", approval_mode="yolo")
-            == "codex --dangerously-bypass-approvals-and-sandbox"
+            == "codex -c disable_paste_burst=true "
+            "--dangerously-bypass-approvals-and-sandbox"
         )
         gemini_cmd = resolve_launch_command("gemini", approval_mode="yolo")
         assert "GEMINI_CLI_SYSTEM_SETTINGS_PATH=" in gemini_cmd
