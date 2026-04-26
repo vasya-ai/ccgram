@@ -1109,7 +1109,9 @@ class TestMaybeDiscoverTranscript:
             provider_name="codex",
         )
 
-    async def test_updates_when_new_session_discovered_for_same_window(self) -> None:
+    async def test_skips_rediscovery_when_window_already_has_hookless_mapping(
+        self,
+    ) -> None:
         from ccgram.handlers.transcript_discovery import (
             discover_and_register_transcript,
         )
@@ -1151,13 +1153,61 @@ class TestMaybeDiscoverTranscript:
             mock_tmux.get_pane_title = AsyncMock(return_value="")
             await discover_and_register_transcript("@7")
 
-        mock_sms.register_hookless_session.assert_called_once_with(
-            window_id="@7",
-            session_id="uuid-new",
-            cwd="/my/project",
-            transcript_path="/path/to/new.jsonl",
-            provider_name="codex",
+        mock_provider.discover_transcript.assert_not_called()
+        mock_sms.register_hookless_session.assert_not_called()
+        mock_sms.write_hookless_session_map.assert_not_called()
+
+    async def test_skips_discovered_transcript_owned_by_another_window(self) -> None:
+        from ccgram.handlers.transcript_discovery import (
+            discover_and_register_transcript,
         )
+        from ccgram.providers.base import SessionStartEvent
+
+        mock_provider = MagicMock()
+        mock_provider.capabilities.supports_hook = False
+        mock_provider.capabilities.name = "codex"
+        event = SessionStartEvent(
+            session_id="uuid-owned",
+            cwd="/my/project",
+            transcript_path="/path/to/owned.jsonl",
+            window_key="ccgram:@8",
+        )
+        mock_provider.discover_transcript.return_value = event
+
+        with (
+            patch("ccgram.handlers.transcript_discovery.session_manager") as mock_sm,
+            patch("ccgram.handlers.transcript_discovery.session_map_sync") as mock_sms,
+            patch(
+                "ccgram.handlers.transcript_discovery.get_provider_for_window",
+                return_value=mock_provider,
+            ),
+            patch("ccgram.handlers.transcript_discovery.config") as mock_config,
+            patch("ccgram.handlers.transcript_discovery.tmux_manager") as mock_tmux,
+        ):
+            mock_sm.window_states = {
+                "@7": MagicMock(
+                    session_id="uuid-owned",
+                    cwd="/my/project",
+                    transcript_path="/path/to/owned.jsonl",
+                    provider_name="codex",
+                ),
+                "@8": MagicMock(
+                    session_id="",
+                    cwd="/my/project",
+                    transcript_path="",
+                    provider_name="codex",
+                ),
+            }
+            mock_config.tmux_session_name = "ccgram"
+            mock_tmux.find_window_by_id = AsyncMock(
+                return_value=MagicMock(pane_current_command="bun")
+            )
+            mock_tmux.get_pane_title = AsyncMock(return_value="")
+            await discover_and_register_transcript("@8")
+
+        mock_provider.discover_transcript.assert_called_once()
+        mock_sms.register_hookless_session.assert_not_called()
+        mock_sms.write_hookless_session_map.assert_not_called()
 
     async def test_noop_when_discovery_returns_none(self) -> None:
         from ccgram.handlers.transcript_discovery import (
@@ -1316,7 +1366,7 @@ class TestMaybeDiscoverTranscript:
 
         mock_sm.register_hookless_session.assert_not_called()
 
-    async def test_passes_max_age_zero_when_pane_is_alive(self) -> None:
+    async def test_passes_default_max_age_for_unmapped_alive_pane(self) -> None:
         from ccgram.handlers.transcript_discovery import (
             discover_and_register_transcript,
         )
@@ -1338,6 +1388,48 @@ class TestMaybeDiscoverTranscript:
         ):
             mock_sm.window_states = {
                 "@7": MagicMock(session_id="", cwd="/proj", provider_name="codex")
+            }
+            mock_config.tmux_session_name = "ccgram"
+            mock_tmux.find_window_by_id = AsyncMock(
+                return_value=MagicMock(pane_current_command="bun")
+            )
+            mock_tmux.get_pane_title = AsyncMock(return_value="")
+            mock_asyncio.to_thread = AsyncMock(return_value=None)
+            await discover_and_register_transcript("@7")
+
+        discover_call = mock_asyncio.to_thread.call_args_list[0]
+        assert discover_call.args[0] == mock_provider.discover_transcript
+        assert discover_call.kwargs["max_age"] is None
+
+    async def test_passes_max_age_zero_for_known_session_without_transcript(
+        self,
+    ) -> None:
+        from ccgram.handlers.transcript_discovery import (
+            discover_and_register_transcript,
+        )
+
+        mock_provider = MagicMock()
+        mock_provider.capabilities.supports_hook = False
+        mock_provider.capabilities.name = "codex"
+        mock_provider.discover_transcript.return_value = None
+
+        with (
+            patch("ccgram.handlers.transcript_discovery.session_manager") as mock_sm,
+            patch(
+                "ccgram.handlers.transcript_discovery.get_provider_for_window",
+                return_value=mock_provider,
+            ),
+            patch("ccgram.handlers.transcript_discovery.config") as mock_config,
+            patch("ccgram.handlers.transcript_discovery.tmux_manager") as mock_tmux,
+            patch("ccgram.handlers.transcript_discovery.asyncio") as mock_asyncio,
+        ):
+            mock_sm.window_states = {
+                "@7": MagicMock(
+                    session_id="known-session",
+                    cwd="/proj",
+                    transcript_path="",
+                    provider_name="codex",
+                )
             }
             mock_config.tmux_session_name = "ccgram"
             mock_tmux.find_window_by_id = AsyncMock(
@@ -1421,6 +1513,9 @@ class TestMaybeDiscoverTranscript:
             window_id: str, provider_name: str, *, cwd: str | None = None
         ) -> None:
             assert window_id == "@7"
+            if mock_state.provider_name != provider_name:
+                mock_state.session_id = ""
+                mock_state.transcript_path = ""
             mock_state.provider_name = provider_name
             if cwd:
                 mock_state.cwd = cwd
@@ -1506,6 +1601,9 @@ class TestMaybeDiscoverTranscript:
             window_id: str, provider_name: str, *, cwd: str | None = None
         ) -> None:
             assert window_id == "@7"
+            if mock_state.provider_name != provider_name:
+                mock_state.session_id = ""
+                mock_state.transcript_path = ""
             mock_state.provider_name = provider_name
             if cwd:
                 mock_state.cwd = cwd

@@ -39,6 +39,52 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 
+def _has_stable_hookless_session(state: "WindowState", provider_name: str) -> bool:
+    """Return True when a window already owns a hookless transcript.
+
+    Hookless providers do not give us a window-specific transcript marker, so a
+    cwd-only scan is not safe enough to replace an existing mapping. Explicit
+    recovery/provider-switch paths clear the state before rediscovery.
+    """
+    transcript_path = (
+        state.transcript_path if isinstance(state.transcript_path, str) else ""
+    )
+    session_id = state.session_id if isinstance(state.session_id, str) else ""
+    inferred_provider = (
+        detect_provider_from_transcript_path(transcript_path) if transcript_path else ""
+    )
+    return bool(
+        state.provider_name == provider_name
+        and session_id
+        and transcript_path
+        and (not inferred_provider or inferred_provider == provider_name)
+    )
+
+
+def _find_existing_transcript_owner(
+    window_id: str, session_id: str, transcript_path: str
+) -> str:
+    """Find another window already mapped to this transcript/session."""
+    for other_window_id, other_state in session_manager.window_states.items():
+        if other_window_id == window_id:
+            continue
+        other_session_id = (
+            other_state.session_id if isinstance(other_state.session_id, str) else ""
+        )
+        other_transcript_path = (
+            other_state.transcript_path
+            if isinstance(other_state.transcript_path, str)
+            else ""
+        )
+        same_session = bool(session_id and other_session_id == session_id)
+        same_path = bool(
+            transcript_path and other_transcript_path == transcript_path
+        )
+        if same_session or same_path:
+            return other_window_id
+    return ""
+
+
 async def _detect_and_apply_provider(
     window_id: str,
     state: "WindowState",
@@ -133,7 +179,10 @@ async def _find_and_register_transcript(
     )
 
     for provider_name, provider in providers_to_try:
-        max_age = 0 if pane_alive else None
+        if _has_stable_hookless_session(state, provider_name):
+            return
+
+        max_age = 0 if pane_alive and state.session_id else None
         event = await asyncio.to_thread(
             provider.discover_transcript,
             state.cwd,
@@ -148,6 +197,20 @@ async def _find_and_register_transcript(
             and state.transcript_path == event.transcript_path
             and state.provider_name == provider_name
         ):
+            return
+
+        owner = _find_existing_transcript_owner(
+            window_id, event.session_id, event.transcript_path
+        )
+        if owner:
+            logger.warning(
+                "Skipping hookless transcript already owned by another window",
+                window_id=window_id,
+                owner_window_id=owner,
+                provider=provider_name,
+                session_id=event.session_id,
+                transcript_path=event.transcript_path,
+            )
             return
 
         session_map_sync.register_hookless_session(

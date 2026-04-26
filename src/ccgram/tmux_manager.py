@@ -87,6 +87,7 @@ _TmuxError = (
 )
 
 _EXTERNAL_DISCOVERY_TTL = 10.0  # seconds — cache external session discovery
+_TMUX_WINDOW_FIELD_COUNT = 7
 
 
 @dataclass
@@ -260,6 +261,52 @@ class TmuxManager:
         for window in windows:
             if window.window_id == window_id:
                 return window
+        return await self._find_native_window_cli(window_id)
+
+    async def _find_native_window_cli(self, window_id: str) -> TmuxWindow | None:
+        """Fallback lookup via tmux CLI to avoid stale libtmux window snapshots."""
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux",
+                "list-windows",
+                "-t",
+                self.session_name,
+                "-F",
+                "#{window_id}\t#{window_name}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_width}\t#{pane_height}\t#{pane_tty}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+        except (OSError, asyncio.TimeoutError):
+            if proc and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            return None
+
+        if proc.returncode != 0:
+            return None
+
+        for raw_line in stdout.decode("utf-8", "replace").splitlines():
+            parts = raw_line.split("\t")
+            if len(parts) < _TMUX_WINDOW_FIELD_COUNT or parts[0] != window_id:
+                continue
+            name = parts[1]
+            if name == config.tmux_main_window_name:
+                return None
+            if config.own_window_id and window_id == config.own_window_id:
+                return None
+            if name.startswith("_"):
+                return None
+            return TmuxWindow(
+                window_id=parts[0],
+                window_name=name,
+                cwd=parts[2],
+                pane_current_command=parts[3],
+                pane_width=int(parts[4] or 0),
+                pane_height=int(parts[5] or 0),
+                pane_tty=parts[6],
+            )
         return None
 
     async def _find_foreign_window(self, qualified_id: str) -> TmuxWindow | None:

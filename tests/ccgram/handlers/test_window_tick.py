@@ -62,15 +62,20 @@ def _make_status(raw_text="Working...", is_interactive=False, display_label=""):
 class TestTickWindowDeadWindow:
     async def test_dead_window_calls_handle_dead(self):
         bot = AsyncMock(spec=Bot)
-        with patch.object(
-            window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
-        ) as mock_dead:
+        with (
+            patch.object(window_tick, "tmux_manager") as mock_tmux,
+            patch.object(
+                window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
+            ) as mock_dead,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=None)
             await tick_window(bot, 1, 100, "@0", None)
             mock_dead.assert_called_once_with(bot, 1, 100, "@0")
 
     async def test_dead_window_skips_other_work(self):
         bot = AsyncMock(spec=Bot)
         with (
+            patch.object(window_tick, "tmux_manager") as mock_tmux,
             patch.object(
                 window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
             ),
@@ -81,6 +86,7 @@ class TestTickWindowDeadWindow:
                 window_tick, "_scan_window_panes", new_callable=AsyncMock
             ) as mock_scan,
         ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=None)
             await tick_window(bot, 1, 100, "@0", None)
             mock_status.assert_not_called()
             mock_scan.assert_not_called()
@@ -93,6 +99,36 @@ class TestTickWindowDeadWindow:
         ) as mock_dead:
             await tick_window(bot, 1, 100, "@0", None)
             mock_dead.assert_not_called()
+
+    async def test_stale_snapshot_re_resolves_window_before_dead_notification(self):
+        bot = AsyncMock(spec=Bot)
+        w = _make_window()
+        mock_queue = MagicMock()
+        mock_queue.empty.return_value = True
+
+        with (
+            patch.object(window_tick, "tmux_manager") as mock_tmux,
+            patch.object(
+                window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
+            ) as mock_dead,
+            patch.object(
+                window_tick, "discover_and_register_transcript", new_callable=AsyncMock
+            ) as mock_discover,
+            patch.object(window_tick, "get_message_queue", return_value=mock_queue),
+            patch.object(
+                window_tick, "_update_status", new_callable=AsyncMock
+            ) as mock_status,
+            patch.object(window_tick, "_scan_window_panes", new_callable=AsyncMock),
+            patch.object(
+                window_tick, "_maybe_check_passive_shell", new_callable=AsyncMock
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=w)
+            await tick_window(bot, 1, 100, "@0", None)
+
+        mock_dead.assert_not_called()
+        mock_discover.assert_awaited_once()
+        mock_status.assert_awaited_once()
 
 
 class TestTickWindowPendingQueue:

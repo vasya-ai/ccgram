@@ -586,6 +586,12 @@ async def tick_window(
         return
 
     if window is None:
+        # The coordinator passes a per-loop tmux snapshot. A topic may be bound
+        # just after that snapshot was built, so re-resolve before declaring the
+        # session dead.
+        window = await tmux_manager.find_window_by_id(window_id)
+
+    if window is None:
         await _handle_dead_window_notification(bot, user_id, thread_id, window_id)
         return
 
