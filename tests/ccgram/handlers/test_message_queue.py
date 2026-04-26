@@ -236,7 +236,9 @@ class TestDispatch:
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
-    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
+    @patch(
+        "ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock
+    )
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
     async def test_content_task_dispatch(
         self, mock_flush, mock_agent, mock_process, bot, queue, lock
@@ -251,7 +253,9 @@ class TestDispatch:
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
-    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
+    @patch(
+        "ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock
+    )
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
     async def test_final_answer_finishes_agent_bubble(
         self, mock_flush, mock_agent, mock_process, bot, queue, lock
@@ -266,7 +270,9 @@ class TestDispatch:
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
-    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
+    @patch(
+        "ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock
+    )
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
     async def test_duplicate_final_answer_is_suppressed(
         self, mock_flush, mock_agent, mock_process, bot, queue, lock
@@ -296,7 +302,9 @@ class TestDispatch:
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
-    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
+    @patch(
+        "ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock
+    )
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
     async def test_truncated_final_prefix_is_suppressed(
         self, mock_flush, mock_agent, mock_process, bot, queue, lock
@@ -341,7 +349,9 @@ class TestDispatch:
     @patch(
         "ccgram.handlers.message_queue._process_content_task", new_callable=AsyncMock
     )
-    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
+    @patch(
+        "ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock
+    )
     @patch("ccgram.handlers.message_queue.process_tool_event", new_callable=AsyncMock)
     async def test_tool_content_with_followup_routes_to_agent_bubble(
         self, mock_tool_event, mock_agent, mock_process, bot, queue, lock

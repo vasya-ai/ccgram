@@ -2,11 +2,57 @@
 
 import json
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 
 from ccgram.event_reader import read_new_events
 from ccgram.providers.base import HookEvent
+
+
+class _InlineAsyncFile:
+    def __init__(self, path: Path, *args, **kwargs) -> None:
+        self._path = Path(path)
+        self._args = args
+        self._kwargs = kwargs
+        self._file: Any = None
+
+    async def __aenter__(self):
+        self._file = self._path.open(*self._args, **self._kwargs)
+        return self
+
+    async def __aexit__(self, *_exc_info) -> None:
+        if self._file is not None:
+            self._file.close()
+
+    async def seek(self, *args, **kwargs):
+        return self._file.seek(*args, **kwargs)
+
+    async def tell(self):
+        return self._file.tell()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        line = self._file.readline()
+        if line == "":
+            raise StopAsyncIteration
+        return line
+
+
+@pytest.fixture(autouse=True)
+def _inline_aiofiles_open():
+    """Avoid aiofiles threadpool startup in these unit tests."""
+
+    with patch(
+        "ccgram.event_reader.aiofiles.open",
+        side_effect=lambda path, *args, **kwargs: _InlineAsyncFile(
+            path, *args, **kwargs
+        ),
+    ):
+        yield
 
 
 def _write_event(path: Path, event_type: str, window_key: str, session_id: str) -> None:

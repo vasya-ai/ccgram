@@ -191,6 +191,20 @@ def _allow_user():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_recovery_runtime_io():
+    with (
+        patch(f"{_RC}.send_to_window", new_callable=AsyncMock) as mock_send,
+        patch(
+            f"{_RC}.session_map_sync.wait_for_session_map_entry",
+            new_callable=AsyncMock,
+        ) as mock_wait,
+    ):
+        mock_send.return_value = (True, "ok")
+        mock_wait.return_value = True
+        yield
+
+
 @pytest.fixture()
 def _no_group():
     with patch("ccgram.bot.config") as mock_config:
@@ -456,6 +470,7 @@ class TestBotTextHandlerScopedMenu:
 
 
 class TestRecoveryFreshCallback:
+    @patch(f"{_RC}.send_to_window", new_callable=AsyncMock)
     @patch(f"{_RC}.thread_router")
     @patch(f"{_RC}.tmux_manager")
     @patch(f"{_RC}.session_manager")
@@ -466,6 +481,7 @@ class TestRecoveryFreshCallback:
         mock_sm: MagicMock,
         mock_tm: MagicMock,
         mock_tr: MagicMock,
+        mock_send_to_window: AsyncMock,
     ) -> None:
         mock_sm.view_window.return_value = MagicMock(
             cwd="/tmp/project", provider_name=""
@@ -474,7 +490,7 @@ class TestRecoveryFreshCallback:
             return_value=(True, "Window created", "project", "@5")
         )
         mock_sm.wait_for_session_map_entry = AsyncMock()
-        mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+        mock_send_to_window.return_value = (True, "ok")
         mock_tr.resolve_chat_id.return_value = -100999
 
         update = _make_callback_update(data=f"{CB_RECOVERY_FRESH}@0")

@@ -3,11 +3,27 @@
 import json
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from ccgram.llm.summarizer import (
     _build_summary_context,
     _extract_tool_summary,
     summarize_completion,
 )
+
+
+@pytest.fixture(autouse=True)
+def _inline_summarizer_to_thread():
+    """Read transcript fixtures inline instead of opening a thread in tests."""
+
+    async def _run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    with patch(
+        "ccgram.llm.summarizer.asyncio.to_thread",
+        new=AsyncMock(side_effect=_run_inline),
+    ):
+        yield
 
 
 def _make_assistant_tool_use(name: str, input_data: dict) -> str:

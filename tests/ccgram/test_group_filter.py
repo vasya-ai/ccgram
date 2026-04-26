@@ -42,8 +42,9 @@ def _has_chat_filter(f: filters.BaseFilter) -> bool:
 
 
 class TestGroupFilterModule:
+    @patch("ccgram.bot._group_filter", filters.ALL)
     def test_default_is_filters_all(self) -> None:
-        """In test env CCGRAM_GROUP_ID is unset, so _group_filter should be ALL."""
+        """When group filtering is unset, _group_filter should be ALL."""
         from ccgram.bot import _group_filter
 
         assert _group_filter is filters.ALL
@@ -88,8 +89,11 @@ class TestGroupFilterRegistration:
                         "MessageHandler missing group filter"
                     )
 
+    @patch("ccgram.bot._group_filter", filters.ALL)
     @patch("ccgram.bot.config")
-    def test_no_chat_filter_when_group_id_unset(self, mock_config: MagicMock) -> None:
+    def test_no_chat_filter_when_group_id_unset(
+        self, mock_config: MagicMock
+    ) -> None:
         mock_config.telegram_bot_token = "fake:token"
         app = create_bot()
 

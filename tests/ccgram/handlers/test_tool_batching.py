@@ -241,7 +241,9 @@ class TestProcessBatchTask:
             await process_tool_event(
                 bot,
                 1,
-                _make_tool_use(tool_use_id=f"tu{i}", text=f"Bash command {i}", tool_name="Bash"),
+                _make_tool_use(
+                    tool_use_id=f"tu{i}", text=f"Bash command {i}", tool_name="Bash"
+                ),
             )
 
         batch = _active_batches[(1, 10)]
@@ -256,9 +258,7 @@ class TestProcessBatchTask:
         mock_send.assert_awaited_once()
         bot.edit_message_text.assert_not_awaited()
 
-    async def test_overflow_creates_ordered_paginated_bubbles(
-        self, batch_env
-    ) -> None:
+    async def test_overflow_creates_ordered_paginated_bubbles(self, batch_env) -> None:
         bot, mock_send, _ = batch_env
 
         for i in range(90):
@@ -339,7 +339,11 @@ class TestProcessBatchTask:
 
         batch = _active_batches[(1, 10)]
         assert len(batch.entries) == 2
-        assert [segment.kind for segment in batch.segments] == ["tools", "text", "tools"]
+        assert [segment.kind for segment in batch.segments] == [
+            "tools",
+            "text",
+            "tools",
+        ]
         assert batch.telegram_msg_id == 100
         mock_send.assert_awaited_once()
         edited_text = bot.edit_message_text.await_args.kwargs["text"]
@@ -369,7 +373,9 @@ class TestProcessBatchTask:
         bot, _, _ = batch_env
         await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
         await process_tool_event(
-            bot, 1, _make_tool_use(tool_use_id="tu2", text="Bash second", tool_name="Bash")
+            bot,
+            1,
+            _make_tool_use(tool_use_id="tu2", text="Bash second", tool_name="Bash"),
         )
 
         await process_tool_event(bot, 1, _make_tool_result(tool_use_id="other1"))
@@ -388,7 +394,9 @@ class TestProcessBatchTask:
         result = await process_tool_event(bot, 1, task)
         assert result == task
 
-    async def test_tool_result_none_tool_use_id_is_suppressed_with_active_batch(self, batch_env) -> None:
+    async def test_tool_result_none_tool_use_id_is_suppressed_with_active_batch(
+        self, batch_env
+    ) -> None:
         bot, _, _ = batch_env
         await process_tool_event(bot, 1, _make_tool_use(tool_use_id="tu1"))
         task = _make_tool_result(tool_use_id=None, text="result text")
@@ -722,8 +730,12 @@ class TestHandleContentTask:
         mock_tool_event.assert_awaited_once_with(bot, 1, task)
 
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
-    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
-    async def test_assistant_text_keeps_active_batch(self, mock_agent, mock_flush) -> None:
+    @patch(
+        "ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock
+    )
+    async def test_assistant_text_keeps_active_batch(
+        self, mock_agent, mock_flush
+    ) -> None:
         bot = AsyncMock()
         queue: asyncio.Queue[MessageTask] = asyncio.Queue()
         lock = asyncio.Lock()
@@ -737,8 +749,12 @@ class TestHandleContentTask:
         mock_agent.assert_awaited_once_with(bot, 1, task)
 
     @patch("ccgram.handlers.message_queue.flush_if_active", new_callable=AsyncMock)
-    @patch("ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock)
-    async def test_final_text_finishes_agent_bubble(self, mock_agent, mock_flush) -> None:
+    @patch(
+        "ccgram.handlers.message_queue.process_agent_message", new_callable=AsyncMock
+    )
+    async def test_final_text_finishes_agent_bubble(
+        self, mock_agent, mock_flush
+    ) -> None:
         bot = AsyncMock()
         queue: asyncio.Queue[MessageTask] = asyncio.Queue()
         lock = asyncio.Lock()

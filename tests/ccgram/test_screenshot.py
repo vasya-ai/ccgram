@@ -1,11 +1,27 @@
 import io
+from unittest.mock import AsyncMock, patch
 
 from PIL import Image
+import pytest
 
 from ccgram.screenshot import text_to_image
 
 SAMPLE_TEXT = "hello world\nfoo bar"
 SAMPLE_ANSI = "\x1b[32mgreen\x1b[0m normal \x1b[31mred\x1b[0m"
+
+
+@pytest.fixture(autouse=True)
+def _inline_screenshot_to_thread():
+    """Render inline in tests to avoid default-executor teardown hangs."""
+
+    async def _run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    with patch(
+        "ccgram.screenshot.asyncio.to_thread",
+        new=AsyncMock(side_effect=_run_inline),
+    ):
+        yield
 
 
 async def test_default_produces_valid_png():

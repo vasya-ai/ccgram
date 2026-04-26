@@ -2,6 +2,7 @@
 
 import json
 import os
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -10,6 +11,65 @@ from ccgram.monitor_state import TrackedSession
 from ccgram.providers.claude import ClaudeProvider
 from ccgram.providers.codex import CodexProvider
 from ccgram.session_monitor import NewWindowEvent, SessionMonitor
+
+
+class _InlineAsyncFile:
+    def __init__(self, path, *args, **kwargs) -> None:
+        from pathlib import Path
+
+        self._path = Path(path)
+        self._args = args
+        self._kwargs = kwargs
+        self._file: Any = None
+
+    async def __aenter__(self):
+        self._file = self._path.open(*self._args, **self._kwargs)
+        return self
+
+    async def __aexit__(self, *_exc_info) -> None:
+        if self._file is not None:
+            self._file.close()
+
+    async def read(self, *args, **kwargs):
+        return self._file.read(*args, **kwargs)
+
+    async def seek(self, *args, **kwargs):
+        return self._file.seek(*args, **kwargs)
+
+    async def tell(self):
+        return self._file.tell()
+
+    async def readline(self):
+        return self._file.readline()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        line = self._file.readline()
+        if line == "":
+            raise StopAsyncIteration
+        return line
+
+
+@pytest.fixture(autouse=True)
+def _isolate_session_monitor_threaded_io():
+    """Avoid aiofiles/default-executor thread startup in unit tests."""
+
+    async def _inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    def _open(path, *args, **kwargs):
+        return _InlineAsyncFile(path, *args, **kwargs)
+
+    with (
+        patch("ccgram.session_monitor.aiofiles.open", side_effect=_open),
+        patch("ccgram.transcript_reader.aiofiles.open", side_effect=_open),
+        patch(
+            "ccgram.transcript_reader.asyncio.to_thread", side_effect=_inline_to_thread
+        ),
+    ):
+        yield
 
 
 @pytest.fixture

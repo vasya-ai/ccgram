@@ -42,6 +42,20 @@ def _reset():
     terminal_screen_buffer.reset_screen_buffer_state()
 
 
+@pytest.fixture(autouse=True)
+def _inline_window_tick_to_thread():
+    """Keep unit tests from leaking asyncio default-executor threads."""
+
+    async def _run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    with patch(
+        "ccgram.handlers.window_tick.asyncio.to_thread",
+        new=AsyncMock(side_effect=_run_inline),
+    ):
+        yield
+
+
 def _make_window(
     window_id="@0", pane_width=120, pane_height=40, pane_current_command="claude"
 ):

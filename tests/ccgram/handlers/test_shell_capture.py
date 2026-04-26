@@ -966,7 +966,7 @@ class TestMaybeSuggestFix:
                 return_value=mock_completer,
             ),
             patch(
-                "ccgram.handlers.shell_commands.gather_llm_context",
+                "ccgram.handlers.shell_context.gather_llm_context",
                 new_callable=AsyncMock,
                 return_value={"cwd": "/tmp", "shell": "bash", "shell_tools": ""},
             ),
@@ -1005,7 +1005,7 @@ class TestMaybeSuggestFix:
                 return_value=mock_completer,
             ),
             patch(
-                "ccgram.handlers.shell_commands.gather_llm_context",
+                "ccgram.handlers.shell_context.gather_llm_context",
                 new_callable=AsyncMock,
                 return_value={"cwd": "/tmp", "shell": "bash", "shell_tools": ""},
             ),

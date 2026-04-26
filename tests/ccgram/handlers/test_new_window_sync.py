@@ -35,6 +35,16 @@ def monitor(tmp_path) -> SessionMonitor:
     )
 
 
+@pytest.fixture(autouse=True)
+def _skip_provider_auto_detect():
+    """Keep these monitor-topic sync tests independent from a real tmux server."""
+    with patch(
+        "ccgram.handlers.topic_orchestration._auto_detect_provider",
+        new_callable=AsyncMock,
+    ):
+        yield
+
+
 def _make_topic(thread_id: int = 999) -> MagicMock:
     topic = MagicMock()
     topic.message_thread_id = thread_id

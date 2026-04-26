@@ -64,7 +64,7 @@ class TestFormatBatchMessage:
 
         result = format_batch_message([entry])
 
-        assert '~/project/file.py next line' in result
+        assert "~/project/file.py next line" in result
         assert home not in result
 
     def test_mcp_style_tool_uses_mcp_icon_and_short_name(self) -> None:
@@ -96,7 +96,7 @@ class TestFormatBatchMessage:
 
         assert "earlier tools" not in result
         for i in range(4):
-            assert f'file{i}.py' in result
+            assert f"file{i}.py" in result
         assert len(result) <= TELEGRAM_TEXT_LIMIT
 
     def test_agent_pages_preserve_text_tool_text_tool_order(self) -> None:
