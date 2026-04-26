@@ -25,7 +25,6 @@ from .. import window_query
 from ..session_monitor import get_active_monitor
 from ..thread_router import thread_router
 from ..tmux_manager import tmux_manager
-from .cleanup import clear_topic_state
 from .interactive_ui import (
     clear_interactive_mode,
     clear_interactive_msg,
@@ -50,6 +49,7 @@ from .polling_strategies import (
     terminal_screen_buffer,
 )
 from .recovery_callbacks import build_recovery_keyboard
+from .session_teardown import teardown_topic_session
 from .topic_emoji import update_topic_emoji
 from .transcript_discovery import discover_and_register_transcript
 
@@ -293,14 +293,15 @@ async def _handle_dead_window_notification(
                 or "topic_id_invalid" in probe_err.message.lower()
             ):
                 terminal_poll_state.reset_probe_failures(wid)
-                await clear_topic_state(
-                    user_id,
-                    thread_id,
+                await teardown_topic_session(
                     bot,
+                    actor_user_id=user_id,
+                    user_id=user_id,
+                    thread_id=thread_id,
                     window_id=wid,
-                    window_dead=True,
+                    reason="dead_window_thread_gone",
+                    remove_topic=False,
                 )
-                thread_router.unbind_thread(user_id, thread_id)
                 logger.info(
                     "Topic deleted: unbound window %s for thread %d, user %d",
                     wid,

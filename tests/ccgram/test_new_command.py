@@ -90,6 +90,7 @@ class TestCommandRegistration:
 
         assert "new" in handler_commands
         assert "start" in handler_commands
+        assert "kill" in handler_commands
 
     @patch("ccgram.bot.config")
     def test_start_alias_uses_new_command(self, mock_config: MagicMock) -> None:

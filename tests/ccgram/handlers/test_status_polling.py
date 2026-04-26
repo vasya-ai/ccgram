@@ -123,19 +123,25 @@ class TestAutocloseTimers:
         bot = AsyncMock(spec=Bot)
         with (
             patch("ccgram.handlers.topic_lifecycle.config") as mock_config,
-            patch("ccgram.handlers.topic_lifecycle.thread_router") as mock_tr,
             patch("ccgram.handlers.topic_lifecycle.time") as mock_time,
-            patch("ccgram.handlers.topic_lifecycle.clear_topic_state"),
+            patch(
+                "ccgram.handlers.topic_lifecycle.teardown_topic_session",
+                new_callable=AsyncMock,
+            ) as mock_teardown,
         ):
             mock_config.autoclose_done_minutes = 30
             mock_config.autoclose_dead_minutes = minutes
             mock_time.monotonic.return_value = elapsed
-            mock_tr.resolve_chat_id.return_value = -100
+            mock_teardown.return_value.window_status = "killed"
             await check_autoclose_timers(bot)
-        bot.delete_forum_topic.assert_called_once_with(
-            chat_id=-100, message_thread_id=42
+        mock_teardown.assert_awaited_once_with(
+            bot,
+            actor_user_id=1,
+            user_id=1,
+            thread_id=42,
+            reason="autoclose",
+            remove_topic=True,
         )
-        mock_tr.unbind_thread.assert_called_once_with(1, 42)
         assert not _has_autoclose(1, 42)
 
     async def test_check_not_expired_yet(self) -> None:
@@ -168,43 +174,40 @@ class TestAutocloseTimers:
     async def test_check_telegram_error_handled(self) -> None:
         _start_autoclose_timer(1, 42, "done", 0.0)
         bot = AsyncMock(spec=Bot)
-        bot.close_forum_topic.side_effect = TelegramError("fail")
         with (
             patch("ccgram.handlers.topic_lifecycle.config") as mock_config,
-            patch("ccgram.handlers.topic_lifecycle.thread_router") as mock_tr,
             patch("ccgram.handlers.topic_lifecycle.time") as mock_time,
+            patch(
+                "ccgram.handlers.topic_lifecycle.teardown_topic_session",
+                new_callable=AsyncMock,
+            ) as mock_teardown,
         ):
             mock_config.autoclose_done_minutes = 30
             mock_config.autoclose_dead_minutes = 10
             mock_time.monotonic.return_value = 30 * 60 + 1
-            mock_tr.resolve_chat_id.return_value = -100
+            mock_teardown.return_value.window_status = "failed"
             await check_autoclose_timers(bot)
-        assert not _has_autoclose(1, 42)
+        assert _has_autoclose(1, 42)
 
     async def test_check_treats_missing_topic_as_removed(self) -> None:
         _start_autoclose_timer(1, 42, "done", 0.0)
         bot = AsyncMock(spec=Bot)
-        bot.delete_forum_topic.side_effect = BadRequest("Topic_id_invalid")
         with (
             patch("ccgram.handlers.topic_lifecycle.config") as mock_config,
-            patch("ccgram.handlers.topic_lifecycle.thread_router") as mock_tr,
             patch("ccgram.handlers.topic_lifecycle.time") as mock_time,
             patch(
-                "ccgram.handlers.topic_lifecycle.clear_topic_state",
+                "ccgram.handlers.topic_lifecycle.teardown_topic_session",
                 new_callable=AsyncMock,
-            ) as mock_clear,
+            ) as mock_teardown,
         ):
             mock_config.autoclose_done_minutes = 30
             mock_config.autoclose_dead_minutes = 10
             mock_time.monotonic.return_value = 30 * 60 + 1
-            mock_tr.resolve_chat_id.return_value = -100
-            mock_tr.get_window_for_thread.return_value = "@0"
+            mock_teardown.return_value.window_status = "already_gone"
 
             await check_autoclose_timers(bot)
 
-        bot.close_forum_topic.assert_not_called()
-        mock_tr.unbind_thread.assert_called_once_with(1, 42)
-        mock_clear.assert_awaited_once()
+        mock_teardown.assert_awaited_once()
         assert not _has_autoclose(1, 42)
 
 
@@ -729,25 +732,23 @@ class TestProbeFailures:
         mock_window.window_id = "@5"
         with (
             patch("ccgram.handlers.topic_lifecycle.thread_router") as mock_tr,
-            patch("ccgram.handlers.topic_lifecycle.tmux_manager") as mock_tm,
             patch(
-                "ccgram.handlers.topic_lifecycle.clear_topic_state",
+                "ccgram.handlers.topic_lifecycle.teardown_topic_session",
                 new_callable=AsyncMock,
-            ) as mock_cleanup,
+            ) as mock_teardown,
         ):
             mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
             mock_tr.resolve_chat_id.return_value = -100
-            mock_tm.find_window_by_id = AsyncMock(
-                return_value=mock_window if window_alive else None
-            )
-            mock_tm.kill_window = AsyncMock()
             await probe_topic_existence(bot)
-        if window_alive:
-            mock_tm.kill_window.assert_called_once_with("@5")
-        else:
-            mock_tm.kill_window.assert_not_called()
-        mock_cleanup.assert_called_once_with(1, 42, bot, window_id="@5")
-        mock_tr.unbind_thread.assert_called_once_with(1, 42)
+        mock_teardown.assert_awaited_once_with(
+            bot,
+            actor_user_id=1,
+            user_id=1,
+            thread_id=42,
+            window_id="@5",
+            reason="topic_probe_thread_gone",
+            remove_topic=False,
+        )
         assert (
             _window_poll_state.get("@5") is None
             or _window_poll_state["@5"].probe_failures == 0
@@ -1810,21 +1811,24 @@ class TestDeadWindowNotification:
         mock_window.window_id = "@5"
         with (
             patch("ccgram.handlers.topic_lifecycle.thread_router") as mock_tr,
-            patch("ccgram.handlers.topic_lifecycle.tmux_manager") as mock_tm,
             patch(
-                "ccgram.handlers.topic_lifecycle.clear_topic_state",
+                "ccgram.handlers.topic_lifecycle.teardown_topic_session",
                 new_callable=AsyncMock,
-            ) as mock_cleanup,
+            ) as mock_teardown,
         ):
             mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
             mock_tr.resolve_chat_id.return_value = -100
-            mock_tm.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tm.kill_window = AsyncMock()
             await probe_topic_existence(bot)
 
-        mock_tm.kill_window.assert_called_once_with("@5")
-        mock_cleanup.assert_called_once_with(1, 42, bot, window_id="@5")
-        mock_tr.unbind_thread.assert_called_once_with(1, 42)
+        mock_teardown.assert_awaited_once_with(
+            bot,
+            actor_user_id=1,
+            user_id=1,
+            thread_id=42,
+            window_id="@5",
+            reason="topic_probe_thread_gone",
+            remove_topic=False,
+        )
 
 
 class TestPaneAlertHelpers:

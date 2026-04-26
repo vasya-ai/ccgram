@@ -51,6 +51,7 @@ _BOT_COMMANDS: list[tuple[str, str]] = [
     ("commands", "List commands for this topic provider"),
     ("history", "Message history for this topic"),
     ("sessions", "Sessions dashboard"),
+    ("kill", "Kill session and delete topic"),
     ("resume", "Browse and resume past sessions"),
     ("screenshot", "Capture terminal screenshot"),
     ("panes", "List panes in this window"),

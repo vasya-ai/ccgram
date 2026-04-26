@@ -638,9 +638,9 @@ class TestDeadWindowTopicDeleted:
                 return_value=None,
             ),
             patch(
-                "ccgram.handlers.window_tick.clear_topic_state",
+                "ccgram.handlers.window_tick.teardown_topic_session",
                 new_callable=AsyncMock,
-            ) as mock_clear,
+            ) as mock_teardown,
         ):
             mock_tr.resolve_chat_id.return_value = 42
             mock_tr.get_display_name.return_value = "test"
@@ -648,7 +648,10 @@ class TestDeadWindowTopicDeleted:
 
             await _handle_dead_window_notification(bot, 1, 100, "@0")
 
-            mock_clear.assert_awaited_once()
-            _, kwargs = mock_clear.call_args
-            assert kwargs.get("window_dead") is True
-            mock_tr.unbind_thread.assert_called_once_with(1, 100)
+            mock_teardown.assert_awaited_once()
+            _, kwargs = mock_teardown.call_args
+            assert kwargs["user_id"] == 1
+            assert kwargs["thread_id"] == 100
+            assert kwargs["window_id"] == "@0"
+            assert kwargs["reason"] == "dead_window_thread_gone"
+            assert kwargs["remove_topic"] is False

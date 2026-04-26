@@ -257,6 +257,7 @@ class TestRegisterCommands:
         registered = bot.set_my_commands.call_args[0][0]
         names = [c.command for c in registered]
         assert names[0] == "new"
+        assert "kill" in names
         assert "clear" in names
         assert "compact" in names
 

@@ -23,12 +23,11 @@ from ..thread_router import thread_router
 from ..tmux_manager import tmux_manager
 from ..utils import log_throttled
 from ..window_resolver import is_foreign_window
-from .cleanup import clear_topic_state
-from .message_sender import is_thread_gone
 from .polling_strategies import (
     lifecycle_strategy,
     terminal_poll_state,
 )
+from .session_teardown import teardown_topic_session
 
 if TYPE_CHECKING:
     from ..tmux_manager import TmuxWindow
@@ -65,42 +64,17 @@ async def check_autoclose_timers(bot: Bot) -> None:
 
 
 async def _close_expired_topic(bot: Bot, user_id: int, thread_id: int) -> None:
-    """Attempt to close/delete an expired topic and clean up state."""
-    chat_id = thread_router.resolve_chat_id(user_id, thread_id)
-    window_id = thread_router.get_window_for_thread(user_id, thread_id)
-    removed = False
-    try:
-        await bot.delete_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
-        removed = True
-    except TelegramError as e:
-        if is_thread_gone(e):
-            removed = True
-        else:
-            try:
-                await bot.close_forum_topic(
-                    chat_id=chat_id, message_thread_id=thread_id
-                )
-                removed = True
-            except TelegramError as close_err:
-                if is_thread_gone(close_err):
-                    removed = True
-                else:
-                    logger.debug(
-                        "autoclose_failed", thread_id=thread_id, error=str(close_err)
-                    )
-    if removed:
+    """Attempt to terminate an expired topic/session and clean up state."""
+    result = await teardown_topic_session(
+        bot,
+        actor_user_id=user_id,
+        user_id=user_id,
+        thread_id=thread_id,
+        reason="autoclose",
+        remove_topic=True,
+    )
+    if result.window_status != "failed":
         lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
-        logger.info(
-            "auto_removed_topic", chat_id=chat_id, thread_id=thread_id, user_id=user_id
-        )
-        await clear_topic_state(
-            user_id,
-            thread_id,
-            bot=bot,
-            window_id=window_id,
-            window_dead=True,
-        )
-        thread_router.unbind_thread(user_id, thread_id)
 
 
 # ── Unbound window TTL ────────────────────────────────────────────────────
@@ -187,12 +161,16 @@ async def probe_topic_existence(bot: Bot) -> None:
                 "Topic_id_invalid" in e.message
                 or "thread not found" in e.message.lower()
             ):
-                w = await tmux_manager.find_window_by_id(wid)
-                if w:
-                    await tmux_manager.kill_window(w.window_id)
+                await teardown_topic_session(
+                    bot,
+                    actor_user_id=user_id,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    window_id=wid,
+                    reason="topic_probe_thread_gone",
+                    remove_topic=False,
+                )
                 terminal_poll_state.reset_probe_failures(wid)
-                await clear_topic_state(user_id, thread_id, bot, window_id=wid)
-                thread_router.unbind_thread(user_id, thread_id)
                 logger.info(
                     "Topic deleted: killed window_id '%s' and "
                     "unbound thread %d for user %d",
@@ -220,12 +198,7 @@ async def probe_topic_existence(bot: Bot) -> None:
 async def topic_closed_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle topic closure — unbind thread but keep the tmux window alive.
-
-    The window becomes "unbound" and is available for rebinding via the window
-    picker when a new topic is created. Unbound windows are auto-killed after
-    the configured TTL (autoclose_done_minutes) by the status polling loop.
-    """
+    """Handle topic closure — terminate the associated local session."""
     user = update.effective_user
     if not user or not config.is_user_allowed(user.id):
         return
@@ -239,17 +212,18 @@ async def topic_closed_handler(
     window_id = thread_router.get_window_for_thread(user.id, thread_id)
     if window_id:
         display = thread_router.get_display_name(window_id)
-        await clear_topic_state(
-            user.id,
-            thread_id,
+        await teardown_topic_session(
             context.bot,
-            context.user_data,
+            actor_user_id=user.id,
+            user_id=user.id,
+            thread_id=thread_id,
             window_id=window_id,
-            window_dead=False,
+            user_data=context.user_data,
+            reason="telegram_topic_closed",
+            remove_topic=False,
         )
-        thread_router.unbind_thread(user.id, thread_id)
         logger.info(
-            "Topic closed: window %s unbound (kept alive for rebinding, user=%d, thread=%d)",
+            "Topic closed: terminated window %s (user=%d, thread=%d)",
             display,
             user.id,
             thread_id,

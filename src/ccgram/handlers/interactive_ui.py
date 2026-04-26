@@ -39,6 +39,7 @@ from .callback_data import (
     CB_ASK_UP,
 )
 from .message_sender import NO_LINK_PREVIEW, is_thread_gone, rate_limit_send
+from .session_teardown import teardown_topic_session
 
 logger = structlog.get_logger()
 
@@ -303,16 +304,8 @@ async def handle_interactive_ui(
         )
     except BadRequest as e:
         if is_thread_gone(e):
-            logger.warning(
-                "Topic gone for interactive UI (chat=%s thread=%s window=%s), "
-                "backing off %ss — use /sync to recreate",
-                chat_id,
-                thread_id,
-                window_id,
-                int(_DEAD_TOPIC_RETRY_INTERVAL),
-            )
-            _send_cooldowns[ikey] = (
-                now + _DEAD_TOPIC_RETRY_INTERVAL - _SEND_RETRY_INTERVAL
+            await _handle_thread_gone_interactive_ui(
+                bot, user_id, thread_id, window_id, chat_id, ikey, now
             )
         else:
             logger.error("Failed to send interactive UI to %s: %s", chat_id, e)
@@ -323,6 +316,36 @@ async def handle_interactive_ui(
         _interactive_mode[ikey] = window_id
         _send_cooldowns.pop(ikey, None)
     return sent is not None
+
+
+async def _handle_thread_gone_interactive_ui(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    chat_id: int,
+    ikey: tuple[int, int],
+    now: float,
+) -> None:
+    """Trigger lifecycle teardown when Telegram says this topic is gone."""
+    logger.warning(
+        "Topic gone for interactive UI (chat=%s thread=%s window=%s), triggering teardown",
+        chat_id,
+        thread_id,
+        window_id,
+    )
+    _send_cooldowns[ikey] = now + _DEAD_TOPIC_RETRY_INTERVAL - _SEND_RETRY_INTERVAL
+    if thread_id is None:
+        return
+    await teardown_topic_session(
+        bot,
+        actor_user_id=user_id,
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        reason="interactive_ui_thread_gone",
+        remove_topic=False,
+    )
 
 
 async def clear_interactive_msg(

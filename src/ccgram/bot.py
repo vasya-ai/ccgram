@@ -72,6 +72,7 @@ from .handlers.message_routing import handle_new_message
 from .handlers.screenshot_callbacks import panes_command, screenshot_command
 from .handlers.topic_lifecycle import topic_closed_handler, topic_edited_handler
 from .handlers.history import send_history
+from .handlers.kill_command import kill_command
 from .handlers.sessions_dashboard import sessions_command
 from .handlers.sync_command import sync_command
 from .handlers.upgrade import upgrade_command
@@ -526,6 +527,7 @@ def create_bot() -> Application:
     application.add_handler(
         CommandHandler("sessions", sessions_command, filters=_group_filter)
     )
+    application.add_handler(CommandHandler("kill", kill_command, filters=_group_filter))
     application.add_handler(
         CommandHandler("resume", resume_command, filters=_group_filter)
     )

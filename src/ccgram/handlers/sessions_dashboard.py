@@ -2,7 +2,7 @@
 
 Displays a summary of all thread-bound sessions for the current user
 with alive/dead status indicators, per-session action buttons (Esc,
-Screenshot, Kill with two-step confirmation), cwd details, and
+Screenshot, Kill+topic cleanup with two-step confirmation), cwd details, and
 refresh/new-session actions.
 
 Key functions:
@@ -37,8 +37,8 @@ from .callback_data import (
 )
 from .callback_helpers import user_owns_window
 from .callback_registry import register
-from .cleanup import clear_topic_state
 from .message_sender import safe_edit, safe_reply
+from .session_teardown import teardown_topic_session
 
 logger = structlog.get_logger()
 
@@ -96,7 +96,7 @@ async def _build_dashboard(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             if not is_external:
                 row.append(
                     InlineKeyboardButton(
-                        f"\U0001f5d1 Kill {display_name}",
+                        f"\U0001f5d1 Kill+Topic {display_name}",
                         callback_data=f"{CB_SESSIONS_KILL}{window_id}"[:64],
                     ),
                 )
@@ -149,7 +149,7 @@ async def handle_sessions_kill(
     )
     await safe_edit(
         query,
-        f"Kill session '{display}'?\n\nThis will terminate the Claude Code process.",
+        f"Kill session '{display}' and delete/close its topic?",
         reply_markup=keyboard,
     )
 
@@ -157,31 +157,36 @@ async def handle_sessions_kill(
 async def handle_sessions_kill_confirm(
     query: CallbackQuery, user_id: int, window_id: str, bot: Bot
 ) -> None:
-    """Second tap — kill the tmux window, unbind all users, refresh dashboard."""
+    """Second tap — kill the tmux window, remove topics, refresh dashboard."""
     display = thread_router.get_display_name(window_id)
 
-    w = await tmux_manager.find_window_by_id(window_id)
-    if w:
-        await tmux_manager.kill_window(w.window_id)
-
-    # Clean up BEFORE unbind — resolve_chat_id needs group_chat_ids
-    # which unbind_thread deletes
-    for uid, tid, bound_wid in list(thread_router.iter_thread_bindings()):
-        if bound_wid == window_id:
-            await clear_topic_state(uid, tid, bot, window_id=window_id)
-            thread_router.unbind_thread(uid, tid)
-
+    result = await teardown_topic_session(
+        bot,
+        actor_user_id=user_id,
+        window_id=window_id,
+        reason="sessions_kill",
+        remove_topic=True,
+    )
     logger.info(
-        "sessions_kill_confirm: killed window %s (%s), user=%d",
+        "sessions_kill_confirm: window %s (%s), user=%d, status=%s, topic=%s",
         window_id,
         display,
         user_id,
+        result.window_status,
+        result.topic_status,
     )
 
     # Re-render dashboard
     text, keyboard = await _build_dashboard(user_id)
+    prefix = f"\U0001f5d1 Killed '{display}'"
+    if result.window_status == "failed":
+        prefix = f"\u274c Could not kill '{display}'"
+    elif result.topic_status in {"failed", "no_group_chat"}:
+        prefix = f"\u26a0 Killed '{display}', but topic cleanup failed"
     await safe_edit(
-        query, f"\U0001f5d1 Killed '{display}'\n\n{text}", reply_markup=keyboard
+        query,
+        f"{prefix}\n\n{text}",
+        reply_markup=keyboard,
     )
 
 
@@ -211,8 +216,8 @@ async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not user_owns_window(user.id, window_id):
             await query.answer("Not your session", show_alert=True)
             return
+        await query.answer("Killing session...")
         await handle_sessions_kill_confirm(query, user.id, window_id, context.bot)
-        await query.answer("Killed")
     elif data.startswith(CB_SESSIONS_KILL):
         window_id = data[len(CB_SESSIONS_KILL) :]
         if not user_owns_window(user.id, window_id):

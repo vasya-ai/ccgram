@@ -115,6 +115,7 @@ def load_handlers() -> None:
         history_callbacks,
         hook_events,
         interactive_callbacks,
+        kill_command,
         msg_spawn,
         msg_telegram,
         recovery_callbacks,

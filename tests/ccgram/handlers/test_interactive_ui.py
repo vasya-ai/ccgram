@@ -154,6 +154,10 @@ class TestDeadTopicCooldown:
                 "ccgram.handlers.interactive_ui.rate_limit_send",
                 new_callable=AsyncMock,
             ),
+            patch(
+                "ccgram.handlers.interactive_ui.teardown_topic_session",
+                new_callable=AsyncMock,
+            ) as mock_teardown,
         ):
             mock_sm.resolve_chat_id.return_value = -999
 
@@ -168,6 +172,13 @@ class TestDeadTopicCooldown:
             cooldown_remaining = _send_cooldowns[ikey] - time.monotonic()
             assert cooldown_remaining > 30  # well above the default 5s
             assert cooldown_remaining <= _DEAD_TOPIC_RETRY_INTERVAL
+            mock_teardown.assert_awaited_once()
+            _, kwargs = mock_teardown.call_args
+            assert kwargs["user_id"] == 100
+            assert kwargs["thread_id"] == 42
+            assert kwargs["window_id"] == "@2"
+            assert kwargs["reason"] == "interactive_ui_thread_gone"
+            assert kwargs["remove_topic"] is False
 
     async def test_non_dead_topic_error_uses_normal_cooldown(self) -> None:
         from unittest.mock import AsyncMock, patch

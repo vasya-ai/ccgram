@@ -43,17 +43,15 @@ class TestCheckAutocloseTimers:
         )
         with (
             patch("ccgram.handlers.topic_lifecycle.config") as mock_config,
-            patch("ccgram.handlers.topic_lifecycle.thread_router") as mock_router,
             patch(
-                "ccgram.handlers.topic_lifecycle.clear_topic_state",
+                "ccgram.handlers.topic_lifecycle.teardown_topic_session",
                 new_callable=AsyncMock,
-            ),
+            ) as mock_teardown,
         ):
             mock_config.autoclose_done_minutes = 1
-            mock_router.resolve_chat_id.return_value = 42
-            mock_router.get_window_for_thread.return_value = "@0"
+            mock_teardown.return_value.window_status = "killed"
             await check_autoclose_timers(bot)
-        bot.delete_forum_topic.assert_called_once()
+        mock_teardown.assert_awaited_once()
 
     async def test_not_yet_expired_topic_stays(self):
         bot = AsyncMock(spec=Bot)
@@ -99,25 +97,26 @@ class TestPruneStaleState:
 class TestProbeTopicExistence:
     async def test_deleted_topic_unbinds(self):
         bot = AsyncMock(spec=Bot)
-        bot.unpin_all_forum_topic_messages = AsyncMock(
-            side_effect=BadRequest("Topic_id_invalid")
-        )
+        bot.unpin_all_forum_topic_messages = AsyncMock(side_effect=BadRequest("Topic_id_invalid"))
         with (
             patch("ccgram.handlers.topic_lifecycle.thread_router") as mock_router,
-            patch("ccgram.handlers.topic_lifecycle.tmux_manager") as mock_tmux,
             patch(
-                "ccgram.handlers.topic_lifecycle.clear_topic_state",
+                "ccgram.handlers.topic_lifecycle.teardown_topic_session",
                 new_callable=AsyncMock,
-            ),
+            ) as mock_teardown,
         ):
             mock_router.iter_thread_bindings.return_value = [(1, 100, "@0")]
             mock_router.resolve_chat_id.return_value = 42
-            mock_tmux.find_window_by_id = AsyncMock(
-                return_value=MagicMock(window_id="@0")
-            )
-            mock_tmux.kill_window = AsyncMock()
             await probe_topic_existence(bot)
-            mock_router.unbind_thread.assert_called_once_with(1, 100)
+            mock_teardown.assert_awaited_once_with(
+                bot,
+                actor_user_id=1,
+                user_id=1,
+                thread_id=100,
+                window_id="@0",
+                reason="topic_probe_thread_gone",
+                remove_topic=False,
+            )
 
     async def test_suspended_probe_skipped(self):
         bot = AsyncMock(spec=Bot)

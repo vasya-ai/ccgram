@@ -54,6 +54,10 @@ CB_SESSIONS_NEW = "sess:new"
 CB_SESSIONS_KILL = "sess:kill:"  # sess:kill:<window_id>
 CB_SESSIONS_KILL_CONFIRM = "sess:killok:"  # sess:killok:<window_id>
 
+# /kill command confirmation
+CB_KILL_CONFIRM = "kill:ok:"  # kill:ok:<window_id>
+CB_KILL_CANCEL = "kill:x"
+
 # Status message action buttons
 CB_STATUS_ESC = "st:esc:"  # st:esc:<window_id>
 CB_STATUS_SCREENSHOT = "st:ss:"  # st:ss:<window_id>
