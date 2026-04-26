@@ -220,6 +220,7 @@ async def _handle_bind(
     except TelegramError as e:
         logger.debug("Failed to rename topic: %s", e)
 
+    await query.answer("Bound")
     await safe_edit(
         query,
         f"✅ Bound to window `{display}`",
@@ -241,7 +242,6 @@ async def _handle_bind(
             detected,
             is_existing_window=True,
         )
-    await query.answer("Bound")
 
 
 async def _handle_new(
@@ -265,8 +265,8 @@ async def _handle_new(
         context.user_data[BROWSE_PATH_KEY] = start_path
         context.user_data[BROWSE_PAGE_KEY] = 0
         context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
     await query.answer()
+    await safe_edit(query, msg_text, reply_markup=keyboard)
 
 
 async def _handle_cancel(
@@ -285,8 +285,8 @@ async def _handle_cancel(
     if context.user_data is not None:
         context.user_data.pop(PENDING_THREAD_ID, None)
         context.user_data.pop(PENDING_THREAD_TEXT, None)
-    await safe_edit(query, "Cancelled")
     await query.answer("Cancelled")
+    await safe_edit(query, "Cancelled")
 
 
 # --- Registry dispatch entry point ---

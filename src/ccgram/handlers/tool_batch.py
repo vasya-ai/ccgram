@@ -203,7 +203,11 @@ def format_batch_message(
         [AgentBubbleSegment("tools", entries=list(entries))],
         provider_label=provider_label,
     )
-    return pages[0] if pages else _render_tool_bubble([], _tool_bubble_title(provider_label))
+    return (
+        pages[0]
+        if pages
+        else _render_tool_bubble([], _tool_bubble_title(provider_label))
+    )
 
 
 def format_agent_pages(
@@ -254,7 +258,9 @@ def _render_tool_bubble_body(
 ) -> str:
     body_lines: list[str] = [title]
     if hidden_count > 0:
-        body_lines.append(f"{_TOOL_LINE_ELLIPSIS} {hidden_count} earlier tools {_TOOL_LINE_ELLIPSIS}")
+        body_lines.append(
+            f"{_TOOL_LINE_ELLIPSIS} {hidden_count} earlier tools {_TOOL_LINE_ELLIPSIS}"
+        )
     body_lines.extend(visible_lines)
     return "\n".join(body_lines)
 
@@ -318,7 +324,9 @@ class _AgentPageBuilder:
                 continue
 
             if quote_lines:
-                self._append_known_fitting_block(_render_tool_bubble(quote_lines, title))
+                self._append_known_fitting_block(
+                    _render_tool_bubble(quote_lines, title)
+                )
                 quote_lines = []
 
             if not self._quote_fits_current([line], title):
@@ -337,9 +345,7 @@ class _AgentPageBuilder:
     def _block_fits_current(self, block: str) -> bool:
         separator = "\n\n" if self._parts else ""
         candidate = (
-            block
-            if not self._parts
-            else f"{self._current_text()}{separator}{block}"
+            block if not self._parts else f"{self._current_text()}{separator}{block}"
         )
         return _fits_rendered_limit(candidate)
 
@@ -611,7 +617,7 @@ def _entry_from_data(data: dict[str, Any]) -> ToolBatchEntry | None:
             status=status,
             result_text=data.get("result_text"),
         )
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         return None
 
 
@@ -703,7 +709,7 @@ def _batch_from_data(data: dict[str, Any]) -> ToolBatch | None:
             segments=segments,
             total_length=int(data.get("total_length") or 0),
         )
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         return None
 
 
@@ -735,7 +741,7 @@ def _restore_persisted_batch_item(
         user_id = int(item["user_id"])
         thread_id = int(item["thread_id"])
         updated_at = float(item.get("updated_at") or 0)
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         return None
     if now - updated_at > _PERSISTED_BATCH_MAX_AGE_SECONDS:
         return "stale"
@@ -1006,7 +1012,9 @@ async def _sync_batch_pages(
         return _PageSyncResult.SUCCESS
     if clear_status:
         await _clear_status_before_agent_bubble(bot, user_id, thread_id_or_0)
-    return await _sync_rendered_pages(bot, user_id, batch, chat_id, raw_thread_id, pages)
+    return await _sync_rendered_pages(
+        bot, user_id, batch, chat_id, raw_thread_id, pages
+    )
 
 
 def _prepare_batch_pages(batch: ToolBatch) -> list[str]:
@@ -1050,7 +1058,9 @@ async def _sync_rendered_pages(
         if result != _PageSyncResult.SUCCESS:
             return result
     await _delete_stale_pages(bot, batch, chat_id, len(pages))
-    batch.telegram_msg_id = batch.telegram_msg_ids[0] if batch.telegram_msg_ids else None
+    batch.telegram_msg_id = (
+        batch.telegram_msg_ids[0] if batch.telegram_msg_ids else None
+    )
     batch.rendered_pages = list(pages)
     return _PageSyncResult.SUCCESS
 
@@ -1110,7 +1120,13 @@ async def _edit_page(
         index + 1,
         len(pages),
     )
-    return await edit_with_entities_outcome(bot, chat_id, msg_id, page)
+    return await edit_with_entities_outcome(
+        bot,
+        chat_id,
+        msg_id,
+        page,
+        local_throttle=False,
+    )
 
 
 def _store_page_message_id(batch: ToolBatch, index: int, msg_id: int) -> None:
@@ -1304,9 +1320,7 @@ async def process_tool_event(
     batch = _active_batches.get(bkey)
 
     if task.content_type == "tool_result":
-        batch, followup = await _handle_tool_result(
-            task, batch, thread_id_or_0
-        )
+        batch, followup = await _handle_tool_result(task, batch, thread_id_or_0)
         if batch is None:
             return followup
     elif task.content_type == "tool_use":

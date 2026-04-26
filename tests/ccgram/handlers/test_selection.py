@@ -5,6 +5,8 @@ from telegram import InlineKeyboardMarkup
 
 from ccgram.handlers.callback_data import (
     CB_DIR_CANCEL,
+    CB_DIR_PAGE,
+    CB_DIR_SELECT,
     CB_MODE_SELECT,
     CB_PROV_SELECT,
 )
@@ -12,7 +14,9 @@ from ccgram.handlers.directory_browser import build_mode_picker, build_provider_
 from ccgram.handlers.directory_callbacks import (
     _handle_confirm,
     _handle_mode_select,
+    _handle_page,
     _handle_provider_select,
+    _handle_select,
     _try_install_messaging_skill,
 )
 from ccgram.handlers.user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT
@@ -165,6 +169,92 @@ class TestHandleConfirmShowsProviderPicker:
 
         assert "browse_path" in user_data
         assert "state" in user_data
+
+
+class TestDirectoryNavigationAckOrder:
+    @patch("ccgram.handlers.directory_callbacks.safe_edit", new_callable=AsyncMock)
+    @patch("ccgram.handlers.directory_callbacks.build_directory_browser")
+    async def test_select_answers_before_edit(
+        self,
+        mock_build: MagicMock,
+        mock_edit: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        child = tmp_path / "child"
+        child.mkdir()
+        mock_build.return_value = ("Browse:", MagicMock(), [])
+        order: list[str] = []
+
+        async def answer(*_args, **_kwargs) -> None:
+            order.append("answer")
+
+        async def edit(*_args, **_kwargs) -> None:
+            order.append("edit")
+
+        user_data = {
+            "browse_path": str(tmp_path),
+            "browse_dirs": ["child"],
+            PENDING_THREAD_ID: 42,
+        }
+        query = _make_query(data=f"{CB_DIR_SELECT}0")
+        query.answer.side_effect = answer
+        mock_edit.side_effect = edit
+        update = _make_update(thread_id=42)
+        context = _make_context(user_data)
+
+        await _handle_select(query, 100, f"{CB_DIR_SELECT}0", update, context)
+
+        assert order == ["answer", "edit"]
+
+    @patch("ccgram.handlers.directory_callbacks.safe_edit", new_callable=AsyncMock)
+    @patch("ccgram.handlers.directory_callbacks.build_directory_browser")
+    async def test_page_answers_before_edit(
+        self,
+        mock_build: MagicMock,
+        mock_edit: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        mock_build.return_value = ("Browse:", MagicMock(), [])
+        order: list[str] = []
+
+        async def answer(*_args, **_kwargs) -> None:
+            order.append("answer")
+
+        async def edit(*_args, **_kwargs) -> None:
+            order.append("edit")
+
+        user_data = {"browse_path": str(tmp_path), PENDING_THREAD_ID: 42}
+        query = _make_query(data=f"{CB_DIR_PAGE}1")
+        query.answer.side_effect = answer
+        mock_edit.side_effect = edit
+        update = _make_update(thread_id=42)
+        context = _make_context(user_data)
+
+        await _handle_page(query, 100, f"{CB_DIR_PAGE}1", update, context)
+
+        assert order == ["answer", "edit"]
+
+    @patch("ccgram.handlers.directory_callbacks.safe_edit", new_callable=AsyncMock)
+    async def test_stale_select_alerts_without_edit(
+        self,
+        mock_edit: AsyncMock,
+    ) -> None:
+        user_data = {
+            "browse_path": "/tmp",
+            "browse_dirs": ["child"],
+            PENDING_THREAD_ID: 99,
+        }
+        query = _make_query(data=f"{CB_DIR_SELECT}0")
+        update = _make_update(thread_id=42)
+        context = _make_context(user_data)
+
+        await _handle_select(query, 100, f"{CB_DIR_SELECT}0", update, context)
+
+        query.answer.assert_called_once_with(
+            "Stale browser (topic mismatch)",
+            show_alert=True,
+        )
+        mock_edit.assert_not_called()
 
 
 class TestHandleProviderSelect:

@@ -145,8 +145,8 @@ async def _handle_fav(
     msg_text, keyboard, subdirs = build_directory_browser(fav_path, user_id=user_id)
     if context.user_data is not None:
         context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
     await query.answer()
+    await safe_edit(query, msg_text, reply_markup=keyboard)
 
 
 async def _handle_star(
@@ -177,8 +177,8 @@ async def _handle_star(
     )
     if context.user_data is not None:
         context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
     await query.answer("⭐ Starred" if now_starred else "☆ Unstarred")
+    await safe_edit(query, msg_text, reply_markup=keyboard)
 
 
 async def _handle_select(
@@ -229,8 +229,8 @@ async def _handle_select(
     msg_text, keyboard, subdirs = build_directory_browser(new_path_str, user_id=user_id)
     if context.user_data is not None:
         context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
     await query.answer()
+    await safe_edit(query, msg_text, reply_markup=keyboard)
 
 
 async def _handle_up(
@@ -263,8 +263,8 @@ async def _handle_up(
     msg_text, keyboard, subdirs = build_directory_browser(parent_path, user_id=user_id)
     if context.user_data is not None:
         context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
     await query.answer()
+    await safe_edit(query, msg_text, reply_markup=keyboard)
 
 
 async def _handle_home(
@@ -289,8 +289,8 @@ async def _handle_home(
     msg_text, keyboard, subdirs = build_directory_browser(home_path, user_id=user_id)
     if context.user_data is not None:
         context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
     await query.answer()
+    await safe_edit(query, msg_text, reply_markup=keyboard)
 
 
 async def _handle_page(
@@ -326,8 +326,8 @@ async def _handle_page(
     )
     if context.user_data is not None:
         context.user_data[BROWSE_DIRS_KEY] = subdirs
-    await safe_edit(query, msg_text, reply_markup=keyboard)
     await query.answer()
+    await safe_edit(query, msg_text, reply_markup=keyboard)
 
 
 async def _handle_confirm(
@@ -712,8 +712,8 @@ async def _handle_cancel(
     if context.user_data is not None:
         context.user_data.pop(PENDING_THREAD_ID, None)
         context.user_data.pop(PENDING_THREAD_TEXT, None)
-    await safe_edit(query, "Cancelled")
     await query.answer("Cancelled")
+    await safe_edit(query, "Cancelled")
 
 
 # --- Registry dispatch entry point ---

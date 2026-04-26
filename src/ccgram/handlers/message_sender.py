@@ -38,6 +38,14 @@ class EditOutcome(Enum):
     PERMANENT_FAILURE = "permanent_failure"
 
 
+class TrafficClass(Enum):
+    """Telegram I/O priority class for local throttling and diagnostics."""
+
+    INTERACTIVE = "interactive"
+    BACKGROUND_EDIT = "background_edit"
+    BACKGROUND_SEND = "background_send"
+
+
 def is_thread_gone(exc: TelegramError) -> bool:
     """Check if error indicates the Telegram topic/thread no longer exists."""
     if isinstance(exc, BadRequest):
@@ -99,6 +107,10 @@ def _retry_after_seconds(exc: RetryAfter) -> int:
 _last_send_time: dict[int, float] = {}
 _rate_limit_locks: dict[int, asyncio.Lock] = {}
 MESSAGE_SEND_INTERVAL = 0.5  # seconds between messages to same chat
+BACKGROUND_EDIT_INTERVAL = 0.5  # seconds between background edits to same message
+SLOW_INTERACTIVE_API_MS = 1000.0
+_last_background_edit_time: dict[tuple[int, int], float] = {}
+_background_edit_locks: dict[tuple[int, int], asyncio.Lock] = {}
 _LOG_PREVIEW_LIMIT = 220
 
 
@@ -110,28 +122,118 @@ def _log_preview(text: str) -> str:
     return f"{preview[:_LOG_PREVIEW_LIMIT]}..."
 
 
-async def rate_limit_send(chat_id: int) -> None:
+def _coerce_traffic_class(value: TrafficClass | str) -> TrafficClass:
+    """Normalize public traffic class inputs."""
+    if isinstance(value, TrafficClass):
+        return value
+    return TrafficClass(value)
+
+
+def _ms_since(start: float) -> float:
+    """Return elapsed milliseconds since a monotonic timestamp."""
+    return (time.monotonic() - start) * 1000
+
+
+def _maybe_warn_slow_interactive(
+    *,
+    traffic_class: TrafficClass,
+    endpoint: str,
+    chat_id: int | None,
+    thread_id: int | None,
+    message_id: int | None,
+    api_ms: float,
+) -> None:
+    """Warn when a user-visible callback API call is unexpectedly slow."""
+    if (
+        traffic_class is not TrafficClass.INTERACTIVE
+        or api_ms <= SLOW_INTERACTIVE_API_MS
+    ):
+        return
+    logger.warning(
+        "telegram slow interactive call endpoint=%s chat=%s thread=%s "
+        "message_id=%s api_ms=%.1f",
+        endpoint,
+        chat_id,
+        thread_id,
+        message_id,
+        api_ms,
+    )
+
+
+async def rate_limit_send(chat_id: int) -> float:
     """Wait if necessary to avoid Telegram flood control (max 1 msg/sec per chat).
 
     Uses a per-chat lock to serialize concurrent senders, preventing two
     coroutines from computing the same wake-up time and sending simultaneously.
+
+    Returns the local queue wait in milliseconds.
     """
     lock = _rate_limit_locks.setdefault(chat_id, asyncio.Lock())
     async with lock:
+        wait_seconds = 0.0
         now = time.monotonic()
         if chat_id in _last_send_time:
             target = _last_send_time[chat_id] + MESSAGE_SEND_INTERVAL
             if target > now:
-                await asyncio.sleep(target - now)
+                wait_seconds = target - now
+                logger.debug(
+                    "telegram throttle wait traffic_class=%s endpoint=send_message "
+                    "chat=%s delay_ms=%.1f reason=chat_send_interval",
+                    TrafficClass.BACKGROUND_SEND.value,
+                    chat_id,
+                    wait_seconds * 1000,
+                )
+                await asyncio.sleep(wait_seconds)
                 _last_send_time[chat_id] = time.monotonic()
-                return
+                return wait_seconds * 1000
         _last_send_time[chat_id] = time.monotonic()
+        return 0.0
+
+
+async def _rate_limit_background_edit(
+    chat_id: int,
+    message_id: int,
+    traffic_class: TrafficClass,
+) -> float:
+    """Throttle only background edits to the same Telegram message."""
+    if traffic_class is not TrafficClass.BACKGROUND_EDIT:
+        return 0.0
+
+    key = (chat_id, message_id)
+    lock = _background_edit_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        wait_seconds = 0.0
+        now = time.monotonic()
+        if key in _last_background_edit_time:
+            target = _last_background_edit_time[key] + BACKGROUND_EDIT_INTERVAL
+            if target > now:
+                wait_seconds = target - now
+                logger.debug(
+                    "telegram throttle wait traffic_class=%s endpoint=edit_message_text "
+                    "chat=%s message_id=%s delay_ms=%.1f reason=message_edit_interval",
+                    traffic_class.value,
+                    chat_id,
+                    message_id,
+                    wait_seconds * 1000,
+                )
+                await asyncio.sleep(wait_seconds)
+                _last_background_edit_time[key] = time.monotonic()
+                return wait_seconds * 1000
+        _last_background_edit_time[key] = time.monotonic()
+        return 0.0
 
 
 async def _with_entity_fallback(
     send_fn: Callable[..., Awaitable[Any]],
     text: str,
     context_label: str,
+    *,
+    traffic_class: TrafficClass = TrafficClass.INTERACTIVE,
+    endpoint: str = "unknown",
+    chat_id: int | None = None,
+    thread_id: int | None = None,
+    message_id: int | None = None,
+    queue_wait_ms: float = 0.0,
     **kwargs: Any,
 ) -> Message | None:
     """Convert to entities, send, fall back to plain text on error.
@@ -148,13 +250,21 @@ async def _with_entity_fallback(
 
     Returns the result Message on success, None on failure.
     """
+    traffic_class = _coerce_traffic_class(traffic_class)
     plain_text, entities = convert_to_entities(text)
     logger.debug(
-        "telegram %s prepared len=%d entities=%d thread=%s reply_markup=%s preview=%r",
+        "telegram %s prepared traffic_class=%s endpoint=%s chat=%s thread=%s "
+        "message_id=%s queue_wait_ms=%.1f len=%d entities=%d reply_markup=%s "
+        "preview=%r",
         context_label,
+        traffic_class.value,
+        endpoint,
+        chat_id,
+        thread_id if thread_id is not None else kwargs.get("message_thread_id"),
+        message_id,
+        queue_wait_ms,
         len(plain_text),
         len(entities),
-        kwargs.get("message_thread_id"),
         kwargs.get("reply_markup") is not None,
         _log_preview(plain_text),
     )
@@ -167,25 +277,83 @@ async def _with_entity_fallback(
         if phase_entities is not None:
             send_kwargs["entities"] = phase_entities
         try:
+            started = time.monotonic()
             sent = await send_fn(plain_text, **send_kwargs)
+            api_ms = _ms_since(started)
             msg_id = getattr(sent, "message_id", None)
             logger.debug(
-                "telegram %s ok message_id=%s phase=%s",
+                "telegram %s ok traffic_class=%s endpoint=%s chat=%s thread=%s "
+                "message_id=%s result_message_id=%s phase=%s queue_wait_ms=%.1f "
+                "api_ms=%.1f",
                 context_label,
+                traffic_class.value,
+                endpoint,
+                chat_id,
+                (
+                    thread_id
+                    if thread_id is not None
+                    else kwargs.get("message_thread_id")
+                ),
+                message_id,
                 msg_id,
                 "entities" if phase_entities is not None else "plain",
+                queue_wait_ms,
+                api_ms,
+            )
+            _maybe_warn_slow_interactive(
+                traffic_class=traffic_class,
+                endpoint=endpoint,
+                chat_id=chat_id,
+                thread_id=(
+                    thread_id
+                    if thread_id is not None
+                    else kwargs.get("message_thread_id")
+                ),
+                message_id=message_id,
+                api_ms=api_ms,
             )
             return sent
         except RetryAfter as e:
+            retry_after = _retry_after_seconds(e)
+            logger.warning(
+                "telegram %s retry-after traffic_class=%s endpoint=%s chat=%s "
+                "thread=%s message_id=%s retry_after=%s",
+                context_label,
+                traffic_class.value,
+                endpoint,
+                chat_id,
+                (
+                    thread_id
+                    if thread_id is not None
+                    else kwargs.get("message_thread_id")
+                ),
+                message_id,
+                retry_after,
+            )
             await asyncio.sleep(_retry_after_seconds(e) + 1)
             try:
+                started = time.monotonic()
                 sent = await send_fn(plain_text, **send_kwargs)
+                api_ms = _ms_since(started)
                 msg_id = getattr(sent, "message_id", None)
                 logger.debug(
-                    "telegram %s ok after retry message_id=%s phase=%s",
+                    "telegram %s ok after retry traffic_class=%s endpoint=%s "
+                    "chat=%s thread=%s message_id=%s result_message_id=%s "
+                    "phase=%s queue_wait_ms=%.1f api_ms=%.1f",
                     context_label,
+                    traffic_class.value,
+                    endpoint,
+                    chat_id,
+                    (
+                        thread_id
+                        if thread_id is not None
+                        else kwargs.get("message_thread_id")
+                    ),
+                    message_id,
                     msg_id,
                     "entities" if phase_entities is not None else "plain",
+                    queue_wait_ms,
+                    api_ms,
                 )
                 return sent
             except TelegramError as e2:
@@ -196,7 +364,20 @@ async def _with_entity_fallback(
             if is_thread_gone(e):
                 return None
             if context_label.startswith("edit") and is_message_not_modified(e):
-                logger.debug("telegram %s not modified", context_label)
+                logger.debug(
+                    "telegram %s not modified traffic_class=%s endpoint=%s chat=%s "
+                    "thread=%s message_id=%s",
+                    context_label,
+                    traffic_class.value,
+                    endpoint,
+                    chat_id,
+                    (
+                        thread_id
+                        if thread_id is not None
+                        else kwargs.get("message_thread_id")
+                    ),
+                    message_id,
+                )
                 return None
             last_error = e
 
@@ -209,6 +390,9 @@ async def _send_with_fallback(
     bot: Bot,
     chat_id: int,
     text: str,
+    *,
+    traffic_class: TrafficClass = TrafficClass.BACKGROUND_SEND,
+    queue_wait_ms: float = 0.0,
     **kwargs: Any,
 ) -> Message | None:
     """Send message with entity formatting, falling back to plain text on failure.
@@ -221,7 +405,15 @@ async def _send_with_fallback(
         return await bot.send_message(chat_id=chat_id, text=text, **kw)
 
     return await _with_entity_fallback(
-        _send, text, f"send message to {chat_id}", **kwargs
+        _send,
+        text,
+        f"send message to {chat_id}",
+        traffic_class=traffic_class,
+        endpoint="send_message",
+        chat_id=chat_id,
+        thread_id=kwargs.get("message_thread_id"),
+        queue_wait_ms=queue_wait_ms,
+        **kwargs,
     )
 
 
@@ -236,8 +428,15 @@ async def rate_limit_send_message(
     Combines rate_limit_send() + _send_with_fallback() for convenience.
     Returns the sent Message on success, None on failure.
     """
-    await rate_limit_send(chat_id)
-    return await _send_with_fallback(bot, chat_id, text, **kwargs)
+    queue_wait_ms = await rate_limit_send(chat_id)
+    return await _send_with_fallback(
+        bot,
+        chat_id,
+        text,
+        traffic_class=TrafficClass.BACKGROUND_SEND,
+        queue_wait_ms=queue_wait_ms,
+        **kwargs,
+    )
 
 
 async def rate_limit_send_message_strict(
@@ -249,8 +448,22 @@ async def rate_limit_send_message_strict(
     """Rate-limited send with entities only, no plain-text fallback."""
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     plain_text, entities = convert_to_entities(text)
-    await rate_limit_send(chat_id)
+    queue_wait_ms = await rate_limit_send(chat_id)
+    logger.debug(
+        "telegram strict send prepared traffic_class=%s endpoint=send_message "
+        "chat=%s thread=%s queue_wait_ms=%.1f len=%d entities=%d reply_markup=%s "
+        "preview=%r",
+        TrafficClass.BACKGROUND_SEND.value,
+        chat_id,
+        kwargs.get("message_thread_id"),
+        queue_wait_ms,
+        len(plain_text),
+        len(entities),
+        kwargs.get("reply_markup") is not None,
+        _log_preview(plain_text),
+    )
     try:
+        started = time.monotonic()
         sent = await bot.send_message(
             chat_id=chat_id,
             text=plain_text,
@@ -258,10 +471,15 @@ async def rate_limit_send_message_strict(
             **kwargs,
         )
         logger.debug(
-            "telegram strict send ok chat=%s message_id=%s entities=%d",
+            "telegram strict send ok traffic_class=%s endpoint=send_message "
+            "chat=%s thread=%s message_id=%s entities=%d queue_wait_ms=%.1f api_ms=%.1f",
+            TrafficClass.BACKGROUND_SEND.value,
             chat_id,
+            kwargs.get("message_thread_id"),
             getattr(sent, "message_id", None),
             len(entities),
+            queue_wait_ms,
+            _ms_since(started),
         )
         return sent
     except RetryAfter as exc:
@@ -278,7 +496,13 @@ async def rate_limit_send_message_strict(
         return None
 
 
-async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message | None:
+async def safe_reply(
+    message: Message,
+    text: str,
+    *,
+    traffic_class: TrafficClass = TrafficClass.INTERACTIVE,
+    **kwargs: Any,
+) -> Message | None:
     """Reply with entity formatting, falling back to plain text on failure.
 
     Returns None if the original message no longer exists (e.g. deleted topic).
@@ -295,14 +519,54 @@ async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message | No
             raise
 
     try:
-        return await _with_entity_fallback(_reply, text, "reply", **kwargs)
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+        thread_id = getattr(message, "message_thread_id", None)
+
+        return await _with_entity_fallback(
+            _reply,
+            text,
+            "reply",
+            traffic_class=traffic_class,
+            endpoint="send_message",
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_id=getattr(message, "message_id", None),
+            **kwargs,
+        )
     except _MessageGoneError:
         return None
 
 
-async def safe_edit(target: Message | CallbackQuery, text: str, **kwargs: Any) -> None:
+def _edit_target_meta(
+    target: Message | CallbackQuery,
+) -> tuple[int | None, int | None, int | None]:
+    """Extract chat/thread/message ids from a Telegram edit target."""
+    message = target if isinstance(target, Message) else target.message
+    chat = getattr(message, "chat", None)
+    return (
+        getattr(chat, "id", None),
+        getattr(message, "message_thread_id", None),
+        getattr(message, "message_id", None),
+    )
+
+
+async def safe_edit(
+    target: Message | CallbackQuery,
+    text: str,
+    *,
+    traffic_class: TrafficClass = TrafficClass.INTERACTIVE,
+    local_throttle: bool = True,
+    **kwargs: Any,
+) -> None:
     """Edit message with entity formatting, falling back to plain text on failure."""
+    traffic_class = _coerce_traffic_class(traffic_class)
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
+    chat_id, thread_id, message_id = _edit_target_meta(target)
+    queue_wait_ms = (
+        await _rate_limit_background_edit(chat_id, message_id, traffic_class)
+        if local_throttle and chat_id is not None and message_id is not None
+        else 0.0
+    )
     # Message.edit_text vs CallbackQuery.edit_message_text
     raw_edit_fn = (
         target.edit_text if isinstance(target, Message) else target.edit_message_text
@@ -311,7 +575,18 @@ async def safe_edit(target: Message | CallbackQuery, text: str, **kwargs: Any) -
     async def _edit(text: str, **kw: Any) -> Any:
         return await raw_edit_fn(text, **kw)
 
-    await _with_entity_fallback(_edit, text, "edit message", **kwargs)
+    await _with_entity_fallback(
+        _edit,
+        text,
+        "edit message",
+        traffic_class=traffic_class,
+        endpoint="edit_message_text",
+        chat_id=chat_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        queue_wait_ms=queue_wait_ms,
+        **kwargs,
+    )
 
 
 async def safe_send(
@@ -319,6 +594,8 @@ async def safe_send(
     chat_id: int,
     text: str,
     message_thread_id: int | None = None,
+    *,
+    traffic_class: TrafficClass = TrafficClass.INTERACTIVE,
     **kwargs: Any,
 ) -> Message | None:
     """Send message with entity formatting, falling back to plain text on failure."""
@@ -330,7 +607,14 @@ async def safe_send(
         return await bot.send_message(chat_id=chat_id, text=text, **kw)
 
     return await _with_entity_fallback(
-        _send, text, f"send message to {chat_id}", **kwargs
+        _send,
+        text,
+        f"send message to {chat_id}",
+        traffic_class=traffic_class,
+        endpoint="send_message",
+        chat_id=chat_id,
+        thread_id=message_thread_id,
+        **kwargs,
     )
 
 
@@ -339,19 +623,32 @@ async def edit_with_fallback(
     chat_id: int,
     message_id: int,
     text: str,
+    *,
+    traffic_class: TrafficClass = TrafficClass.BACKGROUND_EDIT,
+    local_throttle: bool = True,
     **kwargs: Any,
 ) -> bool:
     """Edit a message with entity formatting, falling back to plain text.
 
     Returns True on success, False on failure.
     """
+    traffic_class = _coerce_traffic_class(traffic_class)
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     plain_text, entities = convert_to_entities(text)
+    queue_wait_ms = (
+        await _rate_limit_background_edit(chat_id, message_id, traffic_class)
+        if local_throttle
+        else 0.0
+    )
     logger.debug(
-        "telegram edit prepared chat=%s message_id=%s len=%d entities=%d "
+        "telegram edit prepared traffic_class=%s endpoint=edit_message_text chat=%s "
+        "thread=%s message_id=%s queue_wait_ms=%.1f len=%d entities=%d "
         "reply_markup=%s preview=%r",
+        traffic_class.value,
         chat_id,
+        kwargs.get("message_thread_id"),
         message_id,
+        queue_wait_ms,
         len(plain_text),
         len(entities),
         kwargs.get("reply_markup") is not None,
@@ -359,6 +656,7 @@ async def edit_with_fallback(
     )
 
     try:
+        started = time.monotonic()
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
@@ -366,7 +664,25 @@ async def edit_with_fallback(
             entities=entities,
             **kwargs,
         )
-        logger.debug("telegram edit ok chat=%s message_id=%s phase=entities", chat_id, message_id)
+        api_ms = _ms_since(started)
+        logger.debug(
+            "telegram edit ok traffic_class=%s endpoint=edit_message_text chat=%s "
+            "thread=%s message_id=%s phase=entities queue_wait_ms=%.1f api_ms=%.1f",
+            traffic_class.value,
+            chat_id,
+            kwargs.get("message_thread_id"),
+            message_id,
+            queue_wait_ms,
+            api_ms,
+        )
+        _maybe_warn_slow_interactive(
+            traffic_class=traffic_class,
+            endpoint="edit_message_text",
+            chat_id=chat_id,
+            thread_id=kwargs.get("message_thread_id"),
+            message_id=message_id,
+            api_ms=api_ms,
+        )
         return True
     except RetryAfter:
         raise
@@ -380,16 +696,23 @@ async def edit_with_fallback(
             return True
         try:
             fallback = plain_text
+            started = time.monotonic()
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=fallback,
                 **kwargs,
             )
+            api_ms = _ms_since(started)
             logger.debug(
-                "telegram edit ok chat=%s message_id=%s phase=plain",
+                "telegram edit ok traffic_class=%s endpoint=edit_message_text chat=%s "
+                "thread=%s message_id=%s phase=plain queue_wait_ms=%.1f api_ms=%.1f",
+                traffic_class.value,
                 chat_id,
+                kwargs.get("message_thread_id"),
                 message_id,
+                queue_wait_ms,
+                api_ms,
             )
             return True
         except RetryAfter:
@@ -415,22 +738,36 @@ async def edit_with_entities_outcome(
     chat_id: int,
     message_id: int,
     text: str,
+    *,
+    traffic_class: TrafficClass = TrafficClass.BACKGROUND_EDIT,
+    local_throttle: bool = True,
     **kwargs: Any,
 ) -> EditOutcome:
     """Edit with entities only and return a structured outcome."""
+    traffic_class = _coerce_traffic_class(traffic_class)
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     plain_text, entities = convert_to_entities(text)
+    queue_wait_ms = (
+        await _rate_limit_background_edit(chat_id, message_id, traffic_class)
+        if local_throttle
+        else 0.0
+    )
     logger.debug(
-        "telegram strict edit prepared chat=%s message_id=%s len=%d entities=%d "
+        "telegram strict edit prepared traffic_class=%s endpoint=edit_message_text "
+        "chat=%s thread=%s message_id=%s queue_wait_ms=%.1f len=%d entities=%d "
         "reply_markup=%s preview=%r",
+        traffic_class.value,
         chat_id,
+        kwargs.get("message_thread_id"),
         message_id,
+        queue_wait_ms,
         len(plain_text),
         len(entities),
         kwargs.get("reply_markup") is not None,
         _log_preview(plain_text),
     )
     try:
+        started = time.monotonic()
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
@@ -438,10 +775,25 @@ async def edit_with_entities_outcome(
             entities=entities,
             **kwargs,
         )
+        api_ms = _ms_since(started)
         logger.debug(
-            "telegram strict edit ok chat=%s message_id=%s phase=entities",
+            "telegram strict edit ok traffic_class=%s endpoint=edit_message_text "
+            "chat=%s thread=%s message_id=%s phase=entities queue_wait_ms=%.1f "
+            "api_ms=%.1f",
+            traffic_class.value,
             chat_id,
+            kwargs.get("message_thread_id"),
             message_id,
+            queue_wait_ms,
+            api_ms,
+        )
+        _maybe_warn_slow_interactive(
+            traffic_class=traffic_class,
+            endpoint="edit_message_text",
+            chat_id=chat_id,
+            thread_id=kwargs.get("message_thread_id"),
+            message_id=message_id,
+            api_ms=api_ms,
         )
         return EditOutcome.APPLIED
     except RetryAfter as exc:

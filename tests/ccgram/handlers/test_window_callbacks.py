@@ -147,6 +147,30 @@ class TestNewWindowCallback:
             mock_edit.assert_called_once()
             query.answer.assert_called_once_with()
 
+    async def test_new_answers_before_edit(self) -> None:
+        order: list[str] = []
+        user_data = {PENDING_THREAD_ID: 42}
+        query, update, context = _make_query_update_context(user_data=user_data)
+
+        async def answer(*_args, **_kwargs) -> None:
+            order.append("answer")
+
+        async def edit(*_args, **_kwargs) -> None:
+            order.append("edit")
+
+        query.answer.side_effect = answer
+        with (
+            patch(
+                "ccgram.handlers.window_callbacks.build_directory_browser",
+                return_value=("Browse:", MagicMock(), ["/a", "/b"]),
+            ),
+            patch("ccgram.handlers.window_callbacks.safe_edit", side_effect=edit),
+            patch("ccgram.handlers.window_callbacks.clear_window_picker_state"),
+        ):
+            await handle_window_callback(query, 100, CB_WIN_NEW, update, context)
+
+        assert order == ["answer", "edit"]
+
     async def test_new_stale_topic_mismatch(self) -> None:
         user_data = {PENDING_THREAD_ID: 99}
         query, update, context = _make_query_update_context(

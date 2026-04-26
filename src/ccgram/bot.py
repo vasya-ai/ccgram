@@ -503,7 +503,7 @@ def create_bot() -> Application:
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
-        .rate_limiter(AIORateLimiter(max_retries=5))
+        .rate_limiter(AIORateLimiter(group_max_rate=0, max_retries=5))
         .request(ResilientPollingHTTPXRequest())
         .get_updates_request(ResilientPollingHTTPXRequest(connection_pool_size=1))
         .post_init(post_init)

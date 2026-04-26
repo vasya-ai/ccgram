@@ -5,8 +5,12 @@ from telegram import Message
 from telegram.error import BadRequest, RetryAfter, TelegramError
 
 from ccgram.handlers.message_sender import (
+    BACKGROUND_EDIT_INTERVAL,
     EditOutcome,
     MESSAGE_SEND_INTERVAL,
+    TrafficClass,
+    _background_edit_locks,
+    _last_background_edit_time,
     _last_send_time,
     _send_with_fallback,
     edit_with_fallback,
@@ -23,8 +27,12 @@ import pytest
 @pytest.fixture(autouse=True)
 def _clear_rate_limit_state():
     _last_send_time.clear()
+    _last_background_edit_time.clear()
+    _background_edit_locks.clear()
     yield
     _last_send_time.clear()
+    _last_background_edit_time.clear()
+    _background_edit_locks.clear()
 
 
 class TestRateLimitSend:
@@ -212,6 +220,59 @@ class TestEditWithFallback:
         ]
         with pytest.raises(RetryAfter):
             await edit_with_fallback(bot, 123, 1, "hello")
+
+
+class TestEditTrafficClasses:
+    async def test_interactive_edit_does_not_wait_on_background_edit_bucket(
+        self,
+    ) -> None:
+        bot = AsyncMock()
+        await edit_with_fallback(bot, 123, 1, "background")
+
+        with patch(
+            "ccgram.handlers.message_sender.asyncio.sleep",
+            new_callable=AsyncMock,
+            spec=asyncio.sleep,
+        ) as mock_sleep:
+            await edit_with_fallback(
+                bot,
+                123,
+                1,
+                "interactive",
+                traffic_class=TrafficClass.INTERACTIVE,
+            )
+
+        mock_sleep.assert_not_called()
+
+    async def test_background_edits_to_same_message_are_throttled(self) -> None:
+        bot = AsyncMock()
+        await edit_with_fallback(bot, 123, 1, "first")
+
+        with patch(
+            "ccgram.handlers.message_sender.asyncio.sleep",
+            new_callable=AsyncMock,
+            spec=asyncio.sleep,
+        ) as mock_sleep:
+            await edit_with_fallback(bot, 123, 1, "second")
+
+        mock_sleep.assert_called_once()
+        wait_time = mock_sleep.call_args.args[0]
+        assert 0 < wait_time <= BACKGROUND_EDIT_INTERVAL
+
+    async def test_background_edits_to_different_messages_are_independent(
+        self,
+    ) -> None:
+        bot = AsyncMock()
+        await edit_with_fallback(bot, 123, 1, "first")
+
+        with patch(
+            "ccgram.handlers.message_sender.asyncio.sleep",
+            new_callable=AsyncMock,
+            spec=asyncio.sleep,
+        ) as mock_sleep:
+            await edit_with_fallback(bot, 123, 2, "second")
+
+        mock_sleep.assert_not_called()
 
 
 class TestStrictAgentBubbleDelivery:
