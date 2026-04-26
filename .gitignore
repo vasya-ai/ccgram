@@ -63,6 +63,7 @@ progress*.txt
 .serena
 .works
 .hermes/
+.codex
 
 # Dev run lock
 .ccgram-dev-run.lock.d/
