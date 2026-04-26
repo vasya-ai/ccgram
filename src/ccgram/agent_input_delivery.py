@@ -130,23 +130,55 @@ def _fingerprint_chunks(text: str) -> list[str]:
 
 def _draft_likely_present(pane_text: str, text: str) -> bool:
     """Heuristic guard: enough prompt fingerprints are visible near pane bottom."""
+    stats = _draft_fingerprint_stats(pane_text, text)
+    return bool(stats["hits"] >= stats["required"] and stats["required"] > 0)
+
+
+def _draft_fingerprint_stats(pane_text: str, text: str) -> dict[str, int | str | bool]:
+    """Return redacted diagnostics for matching a prompt draft in the pane."""
     tail = "\n".join(pane_text.splitlines()[-35:])
     normalized_tail = _normalize_text(tail)
     chunks = _fingerprint_chunks(text)
     if not chunks:
-        return False
+        return {
+            "chunks": 0,
+            "hits": 0,
+            "required": 0,
+            "pane_lines": len(pane_text.splitlines()),
+            "tail_chars": len(tail),
+            "tail_digest": _text_digest(normalized_tail),
+            "paste_burst_marker": "Pasted Content" in pane_text,
+            "submit_hint": "Submit with" in pane_text,
+            "queued_hint": "Messages to be submitted" in pane_text,
+        }
     hits = sum(1 for chunk in chunks if chunk in normalized_tail)
     required = 1 if len(chunks) == 1 else min(2, len(chunks))
-    return hits >= required
+    return {
+        "chunks": len(chunks),
+        "hits": hits,
+        "required": required,
+        "pane_lines": len(pane_text.splitlines()),
+        "tail_chars": len(tail),
+        "tail_digest": _text_digest(normalized_tail),
+        "paste_burst_marker": "Pasted Content" in pane_text,
+        "submit_hint": "Submit with" in pane_text,
+        "queued_hint": "Messages to be submitted" in pane_text,
+    }
 
 
-def _pane_has_agent_status(provider: AgentProvider, pane_text: str) -> bool:
+def _pane_status_label(provider: AgentProvider, pane_text: str) -> str:
     try:
         status = provider.parse_terminal_status(pane_text)
     except Exception:
         logger.exception("submit_user_message: failed to parse terminal status")
-        return False
-    return status is not None
+        return "parse_error"
+    if status is None:
+        return ""
+    return status.display_label or status.raw_text or "status"
+
+
+def _pane_has_agent_status(provider: AgentProvider, pane_text: str) -> bool:
+    return bool(_pane_status_label(provider, pane_text))
 
 
 def _capture_transcript_offset(provider: AgentProvider, transcript_path: Path) -> int:
@@ -256,6 +288,43 @@ async def _capture_offset_if_available(
     return True, offset
 
 
+async def _log_submit_pane_diagnostic(
+    provider: AgentProvider,
+    text: str,
+    *,
+    window_id: str,
+    target_window_id: str,
+    digest: str,
+    phase: str,
+    attempt: int,
+    transcript_offset: int | None,
+) -> None:
+    """Log redacted pane state around Enter/ack timing."""
+    pane_text = await tmux_manager.capture_pane(target_window_id)
+    if not pane_text:
+        logger.debug(
+            "submit_user_message: pane diagnostic unavailable",
+            window_id=window_id,
+            digest=digest,
+            phase=phase,
+            attempt=attempt,
+            transcript_offset=transcript_offset,
+        )
+        return
+
+    stats = _draft_fingerprint_stats(pane_text, text)
+    logger.debug(
+        "submit_user_message: pane diagnostic",
+        window_id=window_id,
+        digest=digest,
+        phase=phase,
+        attempt=attempt,
+        transcript_offset=transcript_offset,
+        status_label=_pane_status_label(provider, pane_text),
+        **stats,
+    )
+
+
 async def _retry_visible_draft(
     provider: AgentProvider,
     transcript_path: Path,
@@ -281,20 +350,33 @@ async def _retry_visible_draft(
                 attempts=attempts,
             )
             break
-        if _pane_has_agent_status(provider, pane_text):
+        stats = _draft_fingerprint_stats(pane_text, text)
+        status_label = _pane_status_label(provider, pane_text)
+        logger.debug(
+            "submit_user_message: retry pane diagnostic",
+            window_id=window_id,
+            digest=digest,
+            attempt=attempts + 1,
+            transcript_offset=current_offset,
+            status_label=status_label,
+            **stats,
+        )
+        if status_label:
             logger.warning(
                 "submit_user_message: retry blocked by agent status",
                 window_id=window_id,
                 digest=digest,
                 attempts=attempts,
+                status_label=status_label,
             )
             break
-        if not _draft_likely_present(pane_text, text):
+        if not (stats["hits"] >= stats["required"] and stats["required"] > 0):
             logger.warning(
                 "submit_user_message: retry blocked; draft fingerprint absent",
                 window_id=window_id,
                 digest=digest,
                 attempts=attempts,
+                **stats,
             )
             break
 
@@ -317,6 +399,16 @@ async def _retry_visible_draft(
                 attempts,
                 current_offset,
             )
+        await _log_submit_pane_diagnostic(
+            provider,
+            text,
+            window_id=window_id,
+            target_window_id=target_window_id,
+            digest=digest,
+            phase="after_retry_enter",
+            attempt=attempts,
+            transcript_offset=current_offset,
+        )
         ack = await _wait_for_user_ack(
             provider,
             transcript_path,
@@ -420,6 +512,17 @@ async def submit_user_message(
 
         await asyncio.sleep(delay)
 
+        await _log_submit_pane_diagnostic(
+            provider,
+            text,
+            window_id=window_id,
+            target_window_id=target_window_id,
+            digest=digest,
+            phase="before_first_enter",
+            attempt=1,
+            transcript_offset=transcript_offset,
+        )
+
         attempts += 1
         submitted = await tmux_manager._submit_enter_locked(target_window_id)
         logger.debug(
@@ -436,6 +539,17 @@ async def submit_user_message(
                 attempts=attempts,
                 transcript_offset=transcript_offset,
             )
+
+        await _log_submit_pane_diagnostic(
+            provider,
+            text,
+            window_id=window_id,
+            target_window_id=target_window_id,
+            digest=digest,
+            phase="after_first_enter",
+            attempt=attempts,
+            transcript_offset=transcript_offset,
+        )
 
         if not can_verify or transcript_path is None or transcript_offset is None:
             return UserSubmitResult(
@@ -468,6 +582,17 @@ async def submit_user_message(
                 transcript_offset=ack.offset,
                 verified=True,
             )
+
+        await _log_submit_pane_diagnostic(
+            provider,
+            text,
+            window_id=window_id,
+            target_window_id=target_window_id,
+            digest=digest,
+            phase="after_first_ack_miss",
+            attempt=attempts,
+            transcript_offset=ack.offset,
+        )
 
         retry = await _retry_visible_draft(
             provider,
