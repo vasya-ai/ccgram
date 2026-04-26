@@ -162,7 +162,9 @@ def test_long_multiline_message_uses_adaptive_delay() -> None:
     assert long <= 2.5
 
 
-async def test_retry_enter_when_draft_fingerprint_visible(tmp_path, monkeypatch) -> None:
+async def test_retry_enter_when_draft_fingerprint_visible(
+    tmp_path, monkeypatch
+) -> None:
     text = "first part " + ("middle " * 80) + "last part"
     transcript = tmp_path / "session.jsonl"
     transcript.write_text("", encoding="utf-8")

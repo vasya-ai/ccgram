@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, TypeVar, TypedDict
 
 import structlog
 
@@ -79,6 +79,18 @@ class _RetryOutcome:
     offset: int | None
 
 
+class _DraftFingerprintStats(TypedDict):
+    chunks: int
+    hits: int
+    required: int
+    pane_lines: int
+    tail_chars: int
+    tail_digest: str
+    paste_burst_marker: bool
+    submit_hint: bool
+    queued_hint: bool
+
+
 async def _run_blocking(func: Callable[..., _T], /, *args: Any) -> _T:
     """Run blocking transcript IO without propagating contextvars."""
     loop = asyncio.get_running_loop()
@@ -134,7 +146,7 @@ def _draft_likely_present(pane_text: str, text: str) -> bool:
     return bool(stats["hits"] >= stats["required"] and stats["required"] > 0)
 
 
-def _draft_fingerprint_stats(pane_text: str, text: str) -> dict[str, int | str | bool]:
+def _draft_fingerprint_stats(pane_text: str, text: str) -> _DraftFingerprintStats:
     """Return redacted diagnostics for matching a prompt draft in the pane."""
     tail = "\n".join(pane_text.splitlines()[-35:])
     normalized_tail = _normalize_text(tail)
@@ -495,7 +507,9 @@ async def submit_user_message(
             submit_delay=delay,
         )
 
-        inserted = await tmux_manager._insert_literal_text_locked(target_window_id, text)
+        inserted = await tmux_manager._insert_literal_text_locked(
+            target_window_id, text
+        )
         logger.debug(
             "submit_user_message: insert result",
             window_id=window_id,
