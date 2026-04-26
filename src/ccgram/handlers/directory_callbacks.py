@@ -15,6 +15,7 @@ Key function: handle_directory_callback (uniform callback handler signature).
 """
 
 import asyncio
+import time
 
 import structlog
 from pathlib import Path
@@ -525,6 +526,16 @@ def _try_install_messaging_skill(provider_name: str, cwd: str) -> None:
         logger.exception("Failed to install messaging skill at %s", cwd)
 
 
+def _mark_hookless_transcript_start(
+    window_id: str,
+    *,
+    supports_hook: bool,
+    timestamp: float,
+) -> None:
+    if not supports_hook:
+        session_manager.set_transcript_not_before(window_id, timestamp)
+
+
 async def _create_window_and_bind(
     query: CallbackQuery,
     user_id: int,
@@ -545,6 +556,9 @@ async def _create_window_and_bind(
     )
 
     launch_command = resolve_launch_command(provider_name, approval_mode=approval_mode)
+    provider = provider_registry.get(provider_name)
+    provider_caps = provider.capabilities
+    transcript_not_before = time.time()
 
     success, message, created_wname, created_wid = await tmux_manager.create_window(
         selected_path, launch_command=launch_command
@@ -556,10 +570,24 @@ async def _create_window_and_bind(
             context.user_data.pop(PENDING_THREAD_TEXT, None)
         return
 
+    if pending_thread_id is not None:
+        thread_router.bind_thread(
+            user_id, pending_thread_id, created_wid, window_name=created_wname
+        )
+        query_message = query.message
+        chat = query_message.chat if query_message else None
+        if chat and chat.type in ("group", "supergroup"):
+            thread_router.set_group_chat_id(user_id, pending_thread_id, chat.id)
+
     user_preferences.update_user_mru(user_id, selected_path)
     session_manager.set_window_cwd(created_wid, selected_path)
     session_manager.set_window_provider(created_wid, provider_name)
     session_manager.set_window_approval_mode(created_wid, approval_mode)
+    _mark_hookless_transcript_start(
+        created_wid,
+        supports_hook=provider_caps.supports_hook,
+        timestamp=transcript_not_before,
+    )
     logger.info(
         "Window created: %s (id=%s) at %s provider=%s mode=%s (user=%d, thread=%s)",
         created_wname,
@@ -572,7 +600,6 @@ async def _create_window_and_bind(
     )
     await tmux_manager.stamp_pane_title(created_wid, provider_name)
 
-    provider_caps = provider_registry.get(provider_name).capabilities
     if provider_caps.chat_first_command_path:
         from .shell_prompt_orchestrator import ensure_setup
 
@@ -581,16 +608,6 @@ async def _create_window_and_bind(
 
     _try_install_messaging_skill(provider_name, selected_path)
 
-    if pending_thread_id is not None:
-        thread_router.bind_thread(
-            user_id, pending_thread_id, created_wid, window_name=created_wname
-        )
-        query_message = query.message
-        chat = query_message.chat if query_message else None
-        if chat and chat.type in ("group", "supergroup"):
-            thread_router.set_group_chat_id(user_id, pending_thread_id, chat.id)
-
-    provider = provider_registry.get(provider_name)
     if approval_mode == "yolo" and provider.capabilities.has_yolo_confirmation:
         await _accept_yolo_confirmation(created_wid)
 

@@ -59,6 +59,17 @@ def _reset():
     _dead_notified.clear()
 
 
+@pytest.fixture(autouse=True)
+def _skip_transcript_provider_process_detection():
+    """Keep polling tests independent from real pane TTY process inspection."""
+    with patch(
+        "ccgram.handlers.transcript_discovery.detect_provider_from_pane",
+        new_callable=AsyncMock,
+        return_value="",
+    ):
+        yield
+
+
 class TestIsShellPrompt:
     @pytest.mark.parametrize(
         "cmd",
@@ -930,6 +941,19 @@ class TestProviderSwitchPromptSetup:
 
 
 class TestMaybeDiscoverTranscript:
+    @pytest.fixture(autouse=True)
+    def _inline_transcript_to_thread(self):
+        """Avoid leaking real default-executor threads from transcript tests."""
+
+        async def _run_inline(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch(
+            "ccgram.handlers.transcript_discovery.asyncio.to_thread",
+            new=AsyncMock(side_effect=_run_inline),
+        ):
+            yield
+
     async def test_noop_when_discovered_session_matches_current(self) -> None:
         from ccgram.handlers.transcript_discovery import (
             discover_and_register_transcript,
@@ -1037,6 +1061,7 @@ class TestMaybeDiscoverTranscript:
         mock_provider.capabilities.supports_hook = True
         with (
             patch("ccgram.handlers.transcript_discovery.session_manager") as mock_sm,
+            patch("ccgram.handlers.transcript_discovery.tmux_manager") as mock_tmux,
             patch(
                 "ccgram.handlers.transcript_discovery.get_provider_for_window",
                 return_value=mock_provider,
@@ -1045,6 +1070,7 @@ class TestMaybeDiscoverTranscript:
             mock_sm.window_states = {
                 "@7": MagicMock(session_id="", cwd="/proj", provider_name="claude")
             }
+            mock_tmux.find_window_by_id = AsyncMock(return_value=None)
             await discover_and_register_transcript("@7")
         mock_sm.register_hookless_session.assert_not_called()
 
@@ -1195,6 +1221,58 @@ class TestMaybeDiscoverTranscript:
                     session_id="",
                     cwd="/my/project",
                     transcript_path="",
+                    provider_name="codex",
+                ),
+            }
+            mock_config.tmux_session_name = "ccgram"
+            mock_tmux.find_window_by_id = AsyncMock(
+                return_value=MagicMock(pane_current_command="bun")
+            )
+            mock_tmux.get_pane_title = AsyncMock(return_value="")
+            await discover_and_register_transcript("@8")
+
+        mock_provider.discover_transcript.assert_called_once()
+        mock_sms.register_hookless_session.assert_not_called()
+        mock_sms.write_hookless_session_map.assert_not_called()
+
+    async def test_skips_discovered_transcript_older_than_window_start(
+        self, tmp_path
+    ) -> None:
+        from ccgram.handlers.transcript_discovery import (
+            discover_and_register_transcript,
+        )
+        from ccgram.providers.base import SessionStartEvent
+
+        transcript = tmp_path / "old.jsonl"
+        transcript.write_text("{}\n")
+        threshold = transcript.stat().st_mtime + 10.0
+
+        mock_provider = MagicMock()
+        mock_provider.capabilities.supports_hook = False
+        mock_provider.capabilities.name = "codex"
+        mock_provider.discover_transcript.return_value = SessionStartEvent(
+            session_id="uuid-old",
+            cwd="/my/project",
+            transcript_path=str(transcript),
+            window_key="ccgram:@8",
+        )
+
+        with (
+            patch("ccgram.handlers.transcript_discovery.session_manager") as mock_sm,
+            patch("ccgram.handlers.transcript_discovery.session_map_sync") as mock_sms,
+            patch(
+                "ccgram.handlers.transcript_discovery.get_provider_for_window",
+                return_value=mock_provider,
+            ),
+            patch("ccgram.handlers.transcript_discovery.config") as mock_config,
+            patch("ccgram.handlers.transcript_discovery.tmux_manager") as mock_tmux,
+        ):
+            mock_sm.window_states = {
+                "@8": MagicMock(
+                    session_id="",
+                    cwd="/my/project",
+                    transcript_path="",
+                    transcript_not_before=threshold,
                     provider_name="codex",
                 ),
             }

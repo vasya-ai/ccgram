@@ -36,6 +36,7 @@ class WindowState:
         cwd: Working directory for direct file path construction
         window_name: Display name of the window
         transcript_path: Direct path to JSONL transcript file (from hook payload)
+        transcript_not_before: Earliest transcript mtime this window may auto-claim
         notification_mode: "all" | "errors_only" | "muted"
         provider_name: Name of the agent provider for this window
         approval_mode: "normal" | "yolo"
@@ -46,6 +47,7 @@ class WindowState:
     cwd: str = ""
     window_name: str = ""
     transcript_path: str = ""
+    transcript_not_before: float = 0.0
     notification_mode: str = "all"
     provider_name: str = ""
     approval_mode: str = DEFAULT_APPROVAL_MODE
@@ -60,6 +62,8 @@ class WindowState:
             d["window_name"] = self.window_name
         if self.transcript_path:
             d["transcript_path"] = self.transcript_path
+        if self.transcript_not_before:
+            d["transcript_not_before"] = self.transcript_not_before
         if self.notification_mode != "all":
             d["notification_mode"] = self.notification_mode
         if self.provider_name:
@@ -77,6 +81,7 @@ class WindowState:
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
             transcript_path=data.get("transcript_path", ""),
+            transcript_not_before=data.get("transcript_not_before", 0.0),
             notification_mode=data.get("notification_mode", "all"),
             provider_name=data.get("provider_name", ""),
             approval_mode=data.get("approval_mode", DEFAULT_APPROVAL_MODE),
@@ -145,12 +150,16 @@ class WindowStateStore:
         if window_id in self.window_states:
             self.window_states[window_id].session_id = ""
             self.window_states[window_id].cwd = ""
+            self.window_states[window_id].transcript_path = ""
+            self.window_states[window_id].transcript_not_before = 0.0
             self._schedule_save()
 
     def clear_window_session(self, window_id: str) -> None:
         """Clear session association for a window (e.g., after /clear command)."""
         state = self.get_window_state(window_id)
         state.session_id = ""
+        state.transcript_path = ""
+        state.transcript_not_before = 0.0
         state.notification_mode = "all"
         self._schedule_save()
         logger.info("Cleared session for window_id %s", window_id)
@@ -224,6 +233,12 @@ class WindowStateStore:
                 state.transcript_path = ""
             self._on_hookless_provider_switch(window_id)
 
+        self._schedule_save()
+
+    def set_transcript_not_before(self, window_id: str, timestamp: float) -> None:
+        """Prevent hookless auto-discovery from claiming older transcripts."""
+        state = self.get_window_state(window_id)
+        state.transcript_not_before = timestamp
         self._schedule_save()
 
     # ------------------------------------------------------------------

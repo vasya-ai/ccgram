@@ -1,6 +1,8 @@
 import json
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
+import pytest
+
 from ccgram.handlers.callback_data import (
     CB_RESUME_CANCEL,
     CB_RESUME_PAGE,
@@ -16,6 +18,20 @@ from ccgram.handlers.resume_command import (
 from ccgram.handlers.user_state import RESUME_SESSIONS
 
 _RC = "ccgram.handlers.resume_command"
+
+
+@pytest.fixture(autouse=True)
+def _inline_resume_to_thread():
+    """Avoid default-executor teardown hangs in resume command unit tests."""
+
+    async def _run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    with patch(
+        f"{_RC}.asyncio.to_thread",
+        new=AsyncMock(side_effect=_run_inline),
+    ):
+        yield
 
 
 def _make_update(
@@ -77,7 +93,7 @@ def _write_codex_session(
     prompt: str = "Fix Codex resume",
     source: object = "cli",
 ) -> None:
-    payload = {"id": session_id, "cwd": cwd}
+    payload: dict[str, object] = {"id": session_id, "cwd": cwd}
     if source is not None:
         payload["source"] = source
     lines = [
@@ -383,7 +399,9 @@ class TestScanAllSessions:
         assert result[0].summary == "Implement auth"
 
     def test_scan_codex_sessions_reads_codex_jsonl(self, tmp_path) -> None:
-        jsonl = tmp_path / ".codex" / "sessions" / "2026" / "04" / "25" / "rollout.jsonl"
+        jsonl = (
+            tmp_path / ".codex" / "sessions" / "2026" / "04" / "25" / "rollout.jsonl"
+        )
         _write_codex_session(
             jsonl,
             session_id="codex-session-1",
@@ -399,6 +417,7 @@ class TestScanAllSessions:
         assert result[0].cwd == "/tmp/codex-proj"
         assert result[0].summary == "Fix Codex resume"
         assert result[0].provider_name == "codex"
+        assert result[0].transcript_path == str(jsonl)
 
     def test_scan_codex_sessions_uses_payload_id_not_filename(self, tmp_path) -> None:
         jsonl = tmp_path / ".codex" / "sessions" / "rollout-outer-name.jsonl"
@@ -763,6 +782,72 @@ class TestResumePickCallback:
             "/tmp/codex",
             agent_args="resume codex-session-1",
             launch_command="codex",
+        )
+
+    @patch(f"{_RC}.resolve_launch_command", side_effect=lambda name, **_kwargs: name)
+    @patch(f"{_RC}.get_provider_for_window")
+    @patch(f"{_RC}.session_map_sync")
+    @patch(f"{_RC}.tmux_manager")
+    @patch(f"{_RC}.thread_router")
+    @patch(f"{_RC}.session_manager")
+    @patch(f"{_RC}.safe_edit", new_callable=AsyncMock)
+    @patch(f"{_RC}.get_thread_id", return_value=42)
+    async def test_codex_pick_claims_selected_transcript_for_new_window(
+        self,
+        _mock_thread_id: MagicMock,
+        _mock_safe_edit: AsyncMock,
+        _mock_sm: MagicMock,
+        mock_tr: MagicMock,
+        mock_tm: MagicMock,
+        mock_session_map: MagicMock,
+        mock_get_provider_for_window: MagicMock,
+        _mock_resolve_launch: MagicMock,
+    ) -> None:
+        mock_tr.get_window_for_thread.return_value = None
+        mock_tr.resolve_chat_id.return_value = -100999
+        mock_tm.create_window = AsyncMock(
+            return_value=(True, "Window created", "project", "@5")
+        )
+
+        codex_provider = MagicMock()
+        codex_provider.capabilities.name = "codex"
+        codex_provider.capabilities.supports_hook = False
+        codex_provider.make_launch_args.return_value = "resume codex-session-1"
+        mock_get_provider_for_window.return_value = codex_provider
+
+        transcript_path = "/tmp/codex-session.jsonl"
+        update = _make_callback_update(data=f"{CB_RESUME_PICK}0")
+        user_data: dict = {
+            RESUME_SESSIONS: [
+                {
+                    "session_id": "codex-session-1",
+                    "summary": "Fix Codex resume",
+                    "cwd": "/tmp/codex",
+                    "provider_name": "codex",
+                    "transcript_path": transcript_path,
+                },
+            ],
+        }
+        ctx = _make_context(user_data)
+        query = update.callback_query
+
+        with patch(f"{_RC}.Path") as mock_path:
+            mock_path.return_value.is_dir.return_value = True
+            await handle_resume_command_callback(query, 100, query.data, update, ctx)
+
+        mock_session_map.claim_hookless_session.assert_called_once_with(
+            window_id="@5",
+            session_id="codex-session-1",
+            cwd="/tmp/codex",
+            transcript_path=transcript_path,
+            provider_name="codex",
+        )
+        mock_session_map.write_hookless_session_map.assert_called_once_with(
+            window_id="@5",
+            session_id="codex-session-1",
+            cwd="/tmp/codex",
+            transcript_path=transcript_path,
+            provider_name="codex",
         )
 
     @patch(f"{_RC}.tmux_manager")

@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -10,6 +11,55 @@ from ccgram.session_resolver import session_resolver
 from ccgram.thread_router import thread_router
 from ccgram.user_preferences import user_preferences
 from ccgram.window_state_store import APPROVAL_MODES, WindowState, window_store
+
+
+class _InlineAsyncFile:
+    def __init__(self, path, *args, **kwargs) -> None:
+        from pathlib import Path
+
+        self._path = Path(path)
+        self._args = args
+        self._kwargs = kwargs
+        self._file: Any = None
+
+    async def __aenter__(self):
+        self._file = self._path.open(*self._args, **self._kwargs)
+        return self
+
+    async def __aexit__(self, *_exc_info) -> None:
+        if self._file is not None:
+            self._file.close()
+
+    async def seek(self, *args, **kwargs):
+        return self._file.seek(*args, **kwargs)
+
+    async def tell(self):
+        return self._file.tell()
+
+    async def readline(self):
+        return self._file.readline()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        line = self._file.readline()
+        if line == "":
+            raise StopAsyncIteration
+        return line
+
+
+@pytest.fixture(autouse=True)
+def _inline_session_resolver_aiofiles():
+    """Avoid aiofiles threadpool startup in session resolver unit tests."""
+
+    with patch(
+        "ccgram.session_resolver.aiofiles.open",
+        side_effect=lambda path, *args, **kwargs: _InlineAsyncFile(
+            path, *args, **kwargs
+        ),
+    ):
+        yield
 
 
 @pytest.fixture
@@ -695,6 +745,28 @@ class TestRegisterHooklessSession:
         assert state.transcript_path == "/home/.codex/sessions/2026/03/02/test.jsonl"
         assert state.provider_name == "codex"
 
+    def test_claim_clears_previous_owner(self, mgr: SessionManager) -> None:
+        mgr.window_states["@1"] = WindowState(
+            session_id="uuid-abc",
+            cwd="/old/project",
+            transcript_path="/path/to/transcript.jsonl",
+            provider_name="codex",
+        )
+
+        session_map_sync.claim_hookless_session(
+            window_id="@2",
+            session_id="uuid-abc",
+            cwd="/new/project",
+            transcript_path="/path/to/transcript.jsonl",
+            provider_name="codex",
+        )
+
+        assert mgr.window_states["@1"].session_id == ""
+        assert mgr.window_states["@1"].transcript_path == ""
+        assert mgr.window_states["@2"].session_id == "uuid-abc"
+        assert mgr.window_states["@2"].cwd == "/new/project"
+        assert mgr.window_states["@2"].transcript_path == "/path/to/transcript.jsonl"
+
 
 class TestResolveSessionForWindow:
     async def test_hookless_uses_persisted_transcript_path(
@@ -822,6 +894,44 @@ class TestWriteHooklessSessionMap:
         raw = json.loads(session_map_file.read_text())
         assert "ccgram:@1" in raw
         assert "ccgram:@7" in raw
+
+    def test_removes_duplicate_session_map_entries(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    "ccgram:@1": {
+                        "session_id": "uuid-abc",
+                        "cwd": "/old/project",
+                        "transcript_path": "/path/same.jsonl",
+                        "provider_name": "codex",
+                    },
+                    "ccgram:@2": {
+                        "session_id": "uuid-other",
+                        "cwd": "/other/project",
+                        "transcript_path": "/path/other.jsonl",
+                        "provider_name": "codex",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr("ccgram.session.config.session_map_file", session_map_file)
+        monkeypatch.setattr("ccgram.session.config.tmux_session_name", "ccgram")
+
+        session_map_sync.write_hookless_session_map(
+            window_id="@7",
+            session_id="uuid-abc",
+            cwd="/new/project",
+            transcript_path="/path/same.jsonl",
+            provider_name="codex",
+        )
+
+        raw = json.loads(session_map_file.read_text())
+        assert "ccgram:@1" not in raw
+        assert "ccgram:@2" in raw
+        assert raw["ccgram:@7"]["session_id"] == "uuid-abc"
 
     def test_handles_missing_session_map_file(
         self, mgr: SessionManager, tmp_path, monkeypatch

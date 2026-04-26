@@ -608,6 +608,10 @@ class SessionManager:
         state.cwd = cwd
         self._save_state()
 
+    def set_transcript_not_before(self, window_id: str, timestamp: float) -> None:
+        """Prevent hookless transcript discovery from claiming older files."""
+        window_store.set_transcript_not_before(window_id, timestamp)
+
     def get_approval_mode(self, window_id: str) -> str:
         """Get approval mode for a window (default: 'normal')."""
         state = self.window_states.get(window_id)

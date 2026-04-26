@@ -13,6 +13,7 @@ Key functions:
 """
 
 import json
+import asyncio
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,7 @@ class ResumeEntry:
     summary: str
     cwd: str
     provider_name: str = "claude"
+    transcript_path: str = ""
 
 
 def scan_all_sessions(provider_name: str | None = None) -> list[ResumeEntry]:
@@ -135,7 +137,17 @@ def _scan_index_file(
             entry.get("summary", "") or entry.get("firstPrompt", "") or session_id[:12]
         )
         seen_ids.add(session_id)
-        candidates.append((mtime, ResumeEntry(session_id, summary, cwd)))
+        candidates.append(
+            (
+                mtime,
+                ResumeEntry(
+                    session_id,
+                    summary,
+                    cwd,
+                    transcript_path=str(file_path),
+                ),
+            )
+        )
 
 
 def _scan_bare_jsonl(
@@ -165,7 +177,15 @@ def _scan_bare_jsonl(
 
         seen_ids.add(session_id)
         candidates.append(
-            (mtime, ResumeEntry(session_id, summary or session_id[:12], cwd))
+            (
+                mtime,
+                ResumeEntry(
+                    session_id,
+                    summary or session_id[:12],
+                    cwd,
+                    transcript_path=str(jsonl_file),
+                ),
+            )
         )
 
 
@@ -197,7 +217,13 @@ def _scan_codex_sessions() -> list[ResumeEntry]:
         candidates.append(
             (
                 mtime,
-                ResumeEntry(session_id, summary or session_id[:12], cwd, "codex"),
+                ResumeEntry(
+                    session_id,
+                    summary or session_id[:12],
+                    cwd,
+                    "codex",
+                    str(jsonl_file),
+                ),
             )
         )
 
@@ -411,6 +437,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "summary": s.summary,
             "cwd": s.cwd,
             "provider_name": s.provider_name,
+            "transcript_path": s.transcript_path,
         }
         for s in sessions
     ]
@@ -447,6 +474,7 @@ async def _create_resume_window(
     session_id: str,
     cwd: str,
     provider_name: str | None = None,
+    transcript_path: str = "",
 ) -> tuple[bool, str, str, str]:
     """Unbind old window, create a new one with resume args.
 
@@ -462,7 +490,9 @@ async def _create_resume_window(
     old_view = session_manager.view_window(old_window_id) if old_window_id else None
     approval_mode = old_view.approval_mode if old_view else "normal"
     if provider_name:
-        provider = get_provider_for_window(old_window_id or "", provider_name=provider_name)
+        provider = get_provider_for_window(
+            old_window_id or "", provider_name=provider_name
+        )
     elif old_window_id:
         provider = get_provider_for_window(
             old_window_id, provider_name=old_view.provider_name if old_view else None
@@ -477,8 +507,27 @@ async def _create_resume_window(
         cwd, agent_args=launch_args, launch_command=launch_command
     )
     if success:
+        thread_router.bind_thread(
+            user_id, thread_id, created_wid, window_name=created_wname
+        )
         if provider.capabilities.supports_hook:
             await session_map_sync.wait_for_session_map_entry(created_wid)
+        elif transcript_path:
+            session_map_sync.claim_hookless_session(
+                window_id=created_wid,
+                session_id=session_id,
+                cwd=cwd,
+                transcript_path=transcript_path,
+                provider_name=provider.capabilities.name,
+            )
+            await asyncio.to_thread(
+                session_map_sync.write_hookless_session_map,
+                window_id=created_wid,
+                session_id=session_id,
+                cwd=cwd,
+                transcript_path=transcript_path,
+                provider_name=provider.capabilities.name,
+            )
         session_manager.set_window_provider(created_wid, provider.capabilities.name)
         session_manager.set_window_approval_mode(created_wid, approval_mode)
 
@@ -514,6 +563,7 @@ async def _handle_pick(
     session_id = picked["session_id"]
     cwd = picked.get("cwd", "")
     provider_name = picked.get("provider_name")
+    transcript_path = picked.get("transcript_path", "")
 
     if not cwd or not Path(cwd).is_dir():
         await safe_edit(query, "\u274c Project directory no longer exists.")
@@ -522,17 +572,13 @@ async def _handle_pick(
         return
 
     success, message, created_wname, created_wid = await _create_resume_window(
-        user_id, thread_id, session_id, cwd, provider_name
+        user_id, thread_id, session_id, cwd, provider_name, transcript_path
     )
     if not success:
         await safe_edit(query, f"\u274c {message}")
         _clear_resume_state(context.user_data)
         await query.answer("Failed")
         return
-
-    thread_router.bind_thread(
-        user_id, thread_id, created_wid, window_name=created_wname
-    )
 
     # Store group chat_id for routing
     chat = query.message.chat if query.message else None

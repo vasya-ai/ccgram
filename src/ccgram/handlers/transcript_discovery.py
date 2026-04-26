@@ -11,6 +11,7 @@ Key components:
 """
 
 import asyncio
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
@@ -77,12 +78,24 @@ def _find_existing_transcript_owner(
             else ""
         )
         same_session = bool(session_id and other_session_id == session_id)
-        same_path = bool(
-            transcript_path and other_transcript_path == transcript_path
-        )
+        same_path = bool(transcript_path and other_transcript_path == transcript_path)
         if same_session or same_path:
             return other_window_id
     return ""
+
+
+def _is_before_transcript_claim_window(
+    state: "WindowState", transcript_path: str
+) -> bool:
+    """Return True when a hookless transcript predates this window launch."""
+    threshold = getattr(state, "transcript_not_before", 0.0)
+    if not isinstance(threshold, (int, float)) or threshold <= 0:
+        return False
+    try:
+        mtime = Path(transcript_path).stat().st_mtime
+    except OSError:
+        return False
+    return mtime < threshold
 
 
 async def _detect_and_apply_provider(
@@ -190,6 +203,17 @@ async def _find_and_register_transcript(
             max_age=max_age,
         )
         if not event:
+            continue
+
+        if _is_before_transcript_claim_window(state, event.transcript_path):
+            logger.info(
+                "Skipping hookless transcript older than window start",
+                window_id=window_id,
+                provider=provider_name,
+                session_id=event.session_id,
+                transcript_path=event.transcript_path,
+                transcript_not_before=state.transcript_not_before,
+            )
             continue
 
         if (

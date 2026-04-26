@@ -341,8 +341,42 @@ class SessionMapSync:
         state.session_id = session_id
         state.cwd = cwd
         state.transcript_path = transcript_path
+        state.transcript_not_before = 0.0
         state.provider_name = provider_name
         self._schedule_save()
+
+    def claim_hookless_session(
+        self,
+        window_id: str,
+        session_id: str,
+        cwd: str,
+        transcript_path: str,
+        provider_name: str,
+    ) -> None:
+        """Move a hookless session/transcript to one window.
+
+        Auto-discovery should not steal ownership, but an explicit user-selected
+        resume must route future output to the selected topic.
+        """
+        cleared = self._clear_duplicate_hookless_owners(
+            window_id, session_id, transcript_path
+        )
+        self.register_hookless_session(
+            window_id=window_id,
+            session_id=session_id,
+            cwd=cwd,
+            transcript_path=transcript_path,
+            provider_name=provider_name,
+        )
+        if cleared:
+            logger.info(
+                "Transferred hookless session ownership",
+                window_id=window_id,
+                old_window_ids=cleared,
+                session_id=session_id,
+                transcript_path=transcript_path,
+                provider_name=provider_name,
+            )
 
     def write_hookless_session_map(
         self,
@@ -396,6 +430,13 @@ class SessionMapSync:
                                 "Failed to read session_map.json for hookless write"
                             )
                     display_name = thread_router.get_display_name(window_id)
+                    removed_keys = self._remove_duplicate_hookless_entries(
+                        session_map,
+                        keep_key=window_key,
+                        session_id=session_id,
+                        transcript_path=transcript_path,
+                        provider_name=provider_name,
+                    )
                     session_map[window_key] = {
                         "session_id": session_id,
                         "cwd": cwd,
@@ -410,6 +451,14 @@ class SessionMapSync:
                         session_id,
                         cwd,
                     )
+                    if removed_keys:
+                        logger.info(
+                            "Removed duplicate hookless session_map entries",
+                            window_key=window_key,
+                            removed_keys=removed_keys,
+                            session_id=session_id,
+                            transcript_path=transcript_path,
+                        )
                 finally:
                     fcntl.flock(lock_f, fcntl.LOCK_UN)
         except OSError:
@@ -493,6 +542,61 @@ class SessionMapSync:
             thread_router.set_display_name(window_id, new_wname)
             changed = True
         return changed
+
+    def _clear_duplicate_hookless_owners(
+        self,
+        window_id: str,
+        session_id: str,
+        transcript_path: str,
+    ) -> list[str]:
+        """Clear in-memory ownership for duplicate hookless sessions."""
+        from .window_state_store import window_store
+
+        cleared: list[str] = []
+        for other_window_id, state in window_store.window_states.items():
+            if other_window_id == window_id:
+                continue
+            same_session = bool(session_id and state.session_id == session_id)
+            same_path = bool(
+                transcript_path and state.transcript_path == transcript_path
+            )
+            if not (same_session or same_path):
+                continue
+            state.session_id = ""
+            state.transcript_path = ""
+            state.transcript_not_before = 0.0
+            cleared.append(other_window_id)
+        return cleared
+
+    def _remove_duplicate_hookless_entries(
+        self,
+        session_map: dict[str, Any],
+        *,
+        keep_key: str,
+        session_id: str,
+        transcript_path: str,
+        provider_name: str,
+    ) -> list[str]:
+        """Remove persisted entries that would route the same hookless transcript."""
+        removed: list[str] = []
+        for key, info in list(session_map.items()):
+            if key == keep_key or not isinstance(info, dict):
+                continue
+            existing_provider = str(info.get("provider_name", "")).lower()
+            if (
+                existing_provider
+                and provider_name
+                and existing_provider != provider_name
+            ):
+                continue
+            same_session = bool(session_id and info.get("session_id") == session_id)
+            same_path = bool(
+                transcript_path and info.get("transcript_path") == transcript_path
+            )
+            if same_session or same_path:
+                del session_map[key]
+                removed.append(key)
+        return removed
 
 
 session_map_sync = SessionMapSync()
