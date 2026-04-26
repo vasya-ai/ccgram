@@ -267,7 +267,7 @@ async def show_command_approval(
             await safe_send(
                 bot, chat_id, text, message_thread_id=thread_id, reply_markup=keyboard
             )
-    except TelegramError, OSError:
+    except (TelegramError, OSError):
         # If send fails, release the slot so future attempts aren't blocked
         _shell_pending.pop(key, None)
         raise

@@ -122,7 +122,7 @@ async def _get_llm_summary(transcript_path: str) -> str | None:
         from ..llm.summarizer import summarize_completion
 
         return await summarize_completion(transcript_path)
-    except RuntimeError, OSError, ValueError:
+    except (RuntimeError, OSError, ValueError):
         logger.debug("LLM summary failed", exc_info=True)
         return None
 

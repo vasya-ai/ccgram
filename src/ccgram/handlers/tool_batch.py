@@ -617,7 +617,7 @@ def _entry_from_data(data: dict[str, Any]) -> ToolBatchEntry | None:
             status=status,
             result_text=data.get("result_text"),
         )
-    except AttributeError, TypeError, ValueError:
+    except (AttributeError, TypeError, ValueError):
         return None
 
 
@@ -709,7 +709,7 @@ def _batch_from_data(data: dict[str, Any]) -> ToolBatch | None:
             segments=segments,
             total_length=int(data.get("total_length") or 0),
         )
-    except KeyError, TypeError, ValueError:
+    except (KeyError, TypeError, ValueError):
         return None
 
 
@@ -741,7 +741,7 @@ def _restore_persisted_batch_item(
         user_id = int(item["user_id"])
         thread_id = int(item["thread_id"])
         updated_at = float(item.get("updated_at") or 0)
-    except KeyError, TypeError, ValueError:
+    except (KeyError, TypeError, ValueError):
         return None
     if now - updated_at > _PERSISTED_BATCH_MAX_AGE_SECONDS:
         return "stale"

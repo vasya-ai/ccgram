@@ -63,7 +63,7 @@ def is_path_contained(path: Path, root: Path) -> bool:
     """Return True if *path* resolves to a location within *root*."""
     try:
         return path.resolve().is_relative_to(root.resolve())
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return False
 
 
@@ -71,7 +71,7 @@ def is_hidden(path: Path, root: Path) -> bool:
     """Return True if any path component relative to *root* starts with '.'."""
     try:
         rel = path.resolve().relative_to(root.resolve())
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return False
     return any(part.startswith(".") for part in rel.parts)
 
@@ -144,7 +144,7 @@ def is_gitignored(path: Path, cwd: Path) -> bool:
         if result.returncode == 1:
             return False
         # Any other returncode (e.g. fatal git error) — fall through to pathspec
-    except FileNotFoundError, subprocess.TimeoutExpired, OSError:
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
 
     return _gitignored_by_pathspec(path, cwd)

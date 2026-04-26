@@ -46,7 +46,7 @@ async def handle_voice_callback(
         parts = query.data.split(":", 2)  # ["vc", "send"/"drop", "<msg_id>"]
         action = parts[1]
         message_id = int(parts[2])
-    except IndexError, ValueError:
+    except (IndexError, ValueError):
         await query.answer("Invalid callback data")
         return
 

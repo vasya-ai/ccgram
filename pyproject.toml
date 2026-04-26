@@ -70,7 +70,9 @@ version-file = "src/ccgram/_version.py"
 packages = ["src/ccgram"]
 
 [tool.ruff]
-target-version = "py314"
+# Keep formatter output compatible with the system python3 compile check.
+# Python 3.14 allows unparenthesized multi-except syntax; python3 here does not.
+target-version = "py313"
 exclude = ["src/ccgram/_version.py"]
 
 [tool.ruff.lint]

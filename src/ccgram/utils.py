@@ -240,7 +240,7 @@ def detect_tmux_context() -> tuple[str | None, str | None]:
                 return None, None
             name = result.stdout.strip()
             return (name or None), None
-        except subprocess.TimeoutExpired, FileNotFoundError:
+        except (subprocess.TimeoutExpired, FileNotFoundError):
             return None, None
     # Single call to get both session name and window ID
     try:
@@ -263,7 +263,7 @@ def detect_tmux_context() -> tuple[str | None, str | None]:
         session_name = parts[0] if parts[0] else None
         window_id = parts[1] if len(parts) > 1 and parts[1] else None
         return session_name, window_id
-    except subprocess.TimeoutExpired, FileNotFoundError:
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         return None, None
 
 
@@ -291,7 +291,7 @@ def check_duplicate_ccgram(session_name: str) -> str | None:
             text=True,
             timeout=5,
         )
-    except subprocess.TimeoutExpired, FileNotFoundError:
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
     if result.returncode != 0:
         return None

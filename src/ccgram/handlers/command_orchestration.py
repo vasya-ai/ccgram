@@ -351,7 +351,7 @@ async def _probe_transcript_command_error(
                 transcript_path,
                 since_offset,
             )
-    except OSError, NotImplementedError:
+    except (OSError, NotImplementedError):
         return None
 
     messages, _ = provider.parse_transcript_entries(entries, pending_tools={})

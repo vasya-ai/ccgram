@@ -87,7 +87,7 @@ async def _run_spawn_cycle(bot: Bot) -> None:
                 )
                 if not posted:
                     pop_pending(req.id)
-        except OSError, TelegramError:
+        except (OSError, TelegramError):
             pop_pending(req.id)
             logger.debug("Failed to process spawn request", request_id=req.id)
 

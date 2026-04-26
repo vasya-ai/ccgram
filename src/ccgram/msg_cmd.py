@@ -82,7 +82,7 @@ def _get_my_window_id() -> str:
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
-    except OSError, subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         pass
 
     click.echo("Error: could not detect window ID from tmux", err=True)
@@ -170,12 +170,12 @@ def _check_rate_limit(mailbox: Mailbox, window_id: str, limit: int) -> bool:
                 continue
             try:
                 msg = Message.from_dict(json.loads(msg_file.read_text()))
-            except json.JSONDecodeError, OSError, KeyError:
+            except (json.JSONDecodeError, OSError, KeyError):
                 continue
             if msg.from_id == window_id:
                 try:
                     ts = float(msg.id.split("-")[0]) / 1e9
-                except ValueError, IndexError:
+                except (ValueError, IndexError):
                     continue
                 if ts >= cutoff:
                     count += 1

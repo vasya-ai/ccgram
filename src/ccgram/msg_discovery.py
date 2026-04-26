@@ -62,7 +62,7 @@ def export_window_info() -> dict[str, WindowInfo]:
         return {}
     try:
         data = json.loads(state_file.read_text())
-    except json.JSONDecodeError, OSError:
+    except (json.JSONDecodeError, OSError):
         return {}
     result: dict[str, WindowInfo] = {}
     for window_id, ws_data in data.get("window_states", {}).items():
@@ -87,7 +87,7 @@ def _load_declared_file(path: Path) -> dict[str, dict[str, str]]:
         return {}
     try:
         return json.loads(path.read_text())
-    except json.JSONDecodeError, OSError:
+    except (json.JSONDecodeError, OSError):
         return {}
 
 
@@ -107,7 +107,7 @@ def detect_branch(cwd: str) -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except OSError, subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         pass
     return ""
 
