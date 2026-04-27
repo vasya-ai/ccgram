@@ -19,7 +19,11 @@ from ccgram.handlers.directory_callbacks import (
     _handle_select,
     _try_install_messaging_skill,
 )
-from ccgram.handlers.user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT
+from ccgram.handlers.user_state import (
+    PENDING_THREAD_ID,
+    PENDING_THREAD_TEXT,
+    RESUME_THREAD_ID,
+)
 
 
 class TestBuildProviderPicker:
@@ -123,6 +127,33 @@ def _make_update(thread_id: int = 42) -> MagicMock:
 
 
 class TestHandleConfirmShowsProviderPicker:
+    @patch(
+        "ccgram.handlers.resume_command.show_resume_provider_picker",
+        new_callable=AsyncMock,
+    )
+    async def test_confirm_in_resume_flow_shows_resume_provider_picker(
+        self,
+        mock_resume_picker: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        user_data = {
+            "browse_path": str(tmp_path),
+            PENDING_THREAD_ID: 42,
+            RESUME_THREAD_ID: 42,
+        }
+        query = _make_query()
+        update = _make_update(thread_id=42)
+        context = _make_context(user_data)
+
+        await _handle_confirm(query, 100, update, context)
+
+        mock_resume_picker.assert_awaited_once_with(
+            query,
+            str(tmp_path),
+            update,
+            context,
+        )
+
     @patch("ccgram.handlers.directory_callbacks.safe_edit", new_callable=AsyncMock)
     @patch("ccgram.handlers.directory_callbacks.session_manager")
     @patch("ccgram.handlers.directory_callbacks.thread_router")

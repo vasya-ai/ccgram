@@ -56,7 +56,15 @@ from .directory_browser import (
 from .callback_registry import register
 from .message_sender import safe_edit, safe_send
 from .topic_emoji import format_topic_name_for_mode
-from .user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT
+from .user_state import (
+    PENDING_THREAD_ID,
+    PENDING_THREAD_TEXT,
+    RESUME_APPROVAL_MODE,
+    RESUME_PROVIDER,
+    RESUME_SELECTED_CWD,
+    RESUME_SESSIONS,
+    RESUME_THREAD_ID,
+)
 
 logger = structlog.get_logger()
 
@@ -358,6 +366,12 @@ async def _handle_confirm(
         return
 
     await query.answer()
+
+    if _is_resume_flow(context.user_data):
+        from .resume_command import show_resume_provider_picker
+
+        await show_resume_provider_picker(query, selected_path, update, context)
+        return
 
     # Guard against double-click: if thread already has a window, skip
     if pending_thread_id is not None:
@@ -729,8 +743,24 @@ async def _handle_cancel(
     if context.user_data is not None:
         context.user_data.pop(PENDING_THREAD_ID, None)
         context.user_data.pop(PENDING_THREAD_TEXT, None)
+        _clear_resume_flow_state(context.user_data)
     await query.answer("Cancelled")
     await safe_edit(query, "Cancelled")
+
+
+def _is_resume_flow(user_data: dict | None) -> bool:
+    return bool(user_data and user_data.get(RESUME_THREAD_ID) is not None)
+
+
+def _clear_resume_flow_state(user_data: dict) -> None:
+    for key in (
+        RESUME_SESSIONS,
+        RESUME_THREAD_ID,
+        RESUME_SELECTED_CWD,
+        RESUME_PROVIDER,
+        RESUME_APPROVAL_MODE,
+    ):
+        user_data.pop(key, None)
 
 
 # --- Registry dispatch entry point ---

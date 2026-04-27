@@ -76,6 +76,9 @@ CB_RECOVERY_CANCEL = "rec:x"  # cancel recovery
 CB_RESUME_PICK = "res:p:"  # res:p:<index> (session selection)
 CB_RESUME_PAGE = "res:pg:"  # res:pg:<page> (pagination)
 CB_RESUME_CANCEL = "res:x"  # cancel resume browser
+CB_RESUME_PROV_SELECT = "res:prov:"  # res:prov:<provider_name>
+CB_RESUME_MODE_SELECT = "res:mode:"  # res:mode:<provider_name>:<normal|yolo>
+CB_RESUME_DIR_BACK = "res:dir"  # return from session picker to directory browser
 
 # Notification mode UI metadata (canonical mode list lives in session.py)
 NOTIFY_MODE_ICONS: dict[str, str] = {
