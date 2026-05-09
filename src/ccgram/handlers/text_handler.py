@@ -39,7 +39,13 @@ from .message_sender import (
 from .recovery_callbacks import build_recovery_keyboard
 from .polling_strategies import lifecycle_strategy
 from ..topic_state_registry import topic_state
-from .user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT, RECOVERY_WINDOW_ID
+from .user_state import (
+    PENDING_THREAD_ID,
+    RECOVERY_WINDOW_ID,
+    append_pending_prompt,
+    clear_pending_thread,
+    set_pending_thread,
+)
 from .. import window_query
 from ..thread_router import thread_router
 from ..agent_input_delivery import UserSubmitStatus, submit_user_message
@@ -146,29 +152,33 @@ async def _check_ui_guards(
     if user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
         pending_tid = user_data.get(PENDING_THREAD_ID)
         if pending_tid == thread_id:
+            guarded_text = message.text if isinstance(message.text, str) else ""
+            if guarded_text:
+                append_pending_prompt(user_data, guarded_text, message=message)
             await safe_reply(
                 message,
-                "Please use the window picker above, or tap Cancel.",
+                "Got it, queued. Finish the window picker above, or tap Cancel.",
             )
             return True
         # Stale picker state from a different thread — clear it
         clear_window_picker_state(user_data)
-        user_data.pop(PENDING_THREAD_ID, None)
-        user_data.pop(PENDING_THREAD_TEXT, None)
+        clear_pending_thread(user_data)
 
     # Directory browser guard
     if user_data.get(STATE_KEY) == STATE_BROWSING_DIRECTORY:
         pending_tid = user_data.get(PENDING_THREAD_ID)
         if pending_tid == thread_id:
+            guarded_text = message.text if isinstance(message.text, str) else ""
+            if guarded_text:
+                append_pending_prompt(user_data, guarded_text, message=message)
             await safe_reply(
                 message,
-                "Please use the directory browser above, or tap Cancel.",
+                "Got it, queued. Finish the directory browser above, or tap Cancel.",
             )
             return True
         # Stale browsing state from a different thread — clear it
         clear_browse_state(user_data)
-        user_data.pop(PENDING_THREAD_ID, None)
-        user_data.pop(PENDING_THREAD_TEXT, None)
+        clear_pending_thread(user_data)
 
     return False
 
@@ -215,8 +225,13 @@ async def _handle_unbound_topic(
         if user_data is not None:
             user_data[STATE_KEY] = STATE_SELECTING_WINDOW
             user_data[UNBOUND_WINDOWS_KEY] = win_ids
-            user_data[PENDING_THREAD_ID] = thread_id
-            user_data[PENDING_THREAD_TEXT] = text
+            set_pending_thread(
+                user_data,
+                thread_id,
+                text,
+                message=message,
+                locked_for_picker=True,
+            )
         await safe_reply(message, msg_text, reply_markup=keyboard)
         return True
 
@@ -233,8 +248,13 @@ async def _handle_unbound_topic(
         user_data[BROWSE_PATH_KEY] = start_path
         user_data[BROWSE_PAGE_KEY] = 0
         user_data[BROWSE_DIRS_KEY] = subdirs
-        user_data[PENDING_THREAD_ID] = thread_id
-        user_data[PENDING_THREAD_TEXT] = text
+        set_pending_thread(
+            user_data,
+            thread_id,
+            text,
+            message=message,
+            locked_for_picker=True,
+        )
     await safe_reply(message, msg_text, reply_markup=keyboard)
     return True
 
@@ -279,8 +299,13 @@ async def _handle_dead_window(
             user_data[BROWSE_PATH_KEY] = start_path
             user_data[BROWSE_PAGE_KEY] = 0
             user_data[BROWSE_DIRS_KEY] = subdirs
-            user_data[PENDING_THREAD_ID] = thread_id
-            user_data[PENDING_THREAD_TEXT] = text
+            set_pending_thread(
+                user_data,
+                thread_id,
+                text,
+                message=message,
+                locked_for_picker=True,
+            )
         await safe_reply(message, msg_text, reply_markup=keyboard)
         return True
 
@@ -293,8 +318,7 @@ async def _handle_dead_window(
         thread_id,
     )
     if user_data is not None:
-        user_data[PENDING_THREAD_ID] = thread_id
-        user_data[PENDING_THREAD_TEXT] = text
+        set_pending_thread(user_data, thread_id, text, message=message)
         user_data[RECOVERY_WINDOW_ID] = window_id
     keyboard = build_recovery_keyboard(window_id)
     await safe_reply(

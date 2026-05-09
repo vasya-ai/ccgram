@@ -25,6 +25,7 @@ from ccgram.handlers.user_state import (
     PENDING_THREAD_TEXT,
     RECOVERY_SESSIONS,
     RECOVERY_WINDOW_ID,
+    get_pending_prompt_text,
 )
 
 _RC = "ccgram.handlers.recovery_callbacks"
@@ -281,7 +282,7 @@ class TestTextHandlerDeadWindow:
             mock_path.cwd.return_value = mock_path.return_value
             await text_handler(update, ctx)
 
-        assert user_data[PENDING_THREAD_TEXT] == "my pending message"
+        assert get_pending_prompt_text(user_data) == "my pending message"
         assert user_data[PENDING_THREAD_ID] == 42
         assert user_data[RECOVERY_WINDOW_ID] == "@0"
 

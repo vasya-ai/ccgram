@@ -19,6 +19,7 @@ from ccgram.handlers.user_state import (
     PENDING_THREAD_ID,
     PENDING_THREAD_TEXT,
     RECOVERY_WINDOW_ID,
+    get_pending_prompt_text,
 )
 
 _TH = "ccgram.handlers.text_handler"
@@ -46,6 +47,32 @@ class TestCheckUiGuards:
         assert result is True
         mock_reply.assert_called_once()
         assert expected_text in mock_reply.call_args.args[1]
+
+    async def test_same_thread_queues_text(self) -> None:
+        message = AsyncMock()
+        message.text = "second chunk"
+        user_data = {STATE_KEY: STATE_BROWSING_DIRECTORY, PENDING_THREAD_ID: 42}
+
+        with patch(f"{_TH}.safe_reply", new_callable=AsyncMock):
+            result = await _check_ui_guards(user_data, 42, message)
+
+        assert result is True
+        assert get_pending_prompt_text(user_data) == "second chunk"
+
+    async def test_same_thread_appends_to_pending_prompt(self) -> None:
+        message = AsyncMock()
+        message.text = "second chunk"
+        user_data = {
+            STATE_KEY: STATE_BROWSING_DIRECTORY,
+            PENDING_THREAD_ID: 42,
+            PENDING_THREAD_TEXT: "first chunk",
+        }
+
+        with patch(f"{_TH}.safe_reply", new_callable=AsyncMock):
+            result = await _check_ui_guards(user_data, 42, message)
+
+        assert result is True
+        assert get_pending_prompt_text(user_data) == "first chunk\n\nsecond chunk"
 
     @pytest.mark.parametrize(
         "state", [STATE_SELECTING_WINDOW, STATE_BROWSING_DIRECTORY]
@@ -116,7 +143,7 @@ class TestHandleUnboundTopic:
         mock_picker.assert_called_once()
         mock_reply.assert_called_once()
         assert user_data[STATE_KEY] == STATE_SELECTING_WINDOW
-        assert user_data[PENDING_THREAD_TEXT] == "hello"
+        assert get_pending_prompt_text(user_data) == "hello"
 
     @patch(f"{_TH}.safe_reply", new_callable=AsyncMock)
     @patch(f"{_TH}.build_directory_browser")
@@ -168,7 +195,7 @@ class TestHandleUnboundTopic:
         await _handle_unbound_topic(100, 42, "my text", user_data, message)
 
         assert user_data[PENDING_THREAD_ID] == 42
-        assert user_data[PENDING_THREAD_TEXT] == "my text"
+        assert get_pending_prompt_text(user_data) == "my text"
 
 
 class TestHandleDeadWindow:

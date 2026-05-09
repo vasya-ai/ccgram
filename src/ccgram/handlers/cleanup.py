@@ -23,7 +23,7 @@ from ..utils import log_throttle_reset
 from .interactive_ui import clear_interactive_msg
 from .message_queue import enqueue_status_update
 from .status_bubble import clear_status_msg_info
-from .user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT, VOICE_PENDING
+from .user_state import PENDING_THREAD_ID, VOICE_PENDING, clear_pending_thread
 
 
 async def clear_topic_state(
@@ -103,8 +103,7 @@ async def clear_topic_state(
 
     # user_data cleanup
     if user_data is not None and user_data.get(PENDING_THREAD_ID) == thread_id:
-        user_data.pop(PENDING_THREAD_ID, None)
-        user_data.pop(PENDING_THREAD_TEXT, None)
+        clear_pending_thread(user_data)
 
     if user_data is not None:
         voice_store: dict[tuple[int, int], str] = user_data.get(VOICE_PENDING, {})

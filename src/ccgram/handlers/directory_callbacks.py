@@ -58,12 +58,13 @@ from .message_sender import safe_edit, safe_send
 from .topic_emoji import format_topic_name_for_mode
 from .user_state import (
     PENDING_THREAD_ID,
-    PENDING_THREAD_TEXT,
     RESUME_APPROVAL_MODE,
     RESUME_PROVIDER,
     RESUME_SELECTED_CWD,
     RESUME_SESSIONS,
     RESUME_THREAD_ID,
+    clear_pending_thread,
+    flush_pending_prompt_text,
 )
 
 logger = structlog.get_logger()
@@ -360,8 +361,7 @@ async def _handle_confirm(
     if pending_thread_id is not None and confirm_thread_id != pending_thread_id:
         clear_browse_state(context.user_data)
         if context.user_data is not None:
-            context.user_data.pop(PENDING_THREAD_ID, None)
-            context.user_data.pop(PENDING_THREAD_TEXT, None)
+            clear_pending_thread(context.user_data)
         await query.answer("Stale browser (topic mismatch)", show_alert=True)
         return
 
@@ -407,8 +407,7 @@ async def _validate_provider_select(
     confirm_thread_id = get_thread_id(update)
     if pending_thread_id is not None and confirm_thread_id != pending_thread_id:
         if context.user_data is not None:
-            context.user_data.pop(PENDING_THREAD_ID, None)
-            context.user_data.pop(PENDING_THREAD_TEXT, None)
+            clear_pending_thread(context.user_data)
         await query.answer("Stale browser (topic mismatch)", show_alert=True)
         return False
 
@@ -580,8 +579,7 @@ async def _create_window_and_bind(
     if not success:
         await safe_edit(query, f"❌ {message}")
         if pending_thread_id is not None and context.user_data is not None:
-            context.user_data.pop(PENDING_THREAD_ID, None)
-            context.user_data.pop(PENDING_THREAD_TEXT, None)
+            clear_pending_thread(context.user_data)
         return
 
     if pending_thread_id is not None:
@@ -646,19 +644,13 @@ async def _create_window_and_bind(
         f"✅ {message}\n\nBound to this topic. Send messages here.",
     )
 
-    pending_text = (
-        context.user_data.get(PENDING_THREAD_TEXT) if context.user_data else None
-    )
+    pending_text = flush_pending_prompt_text(context.user_data)
     if pending_text:
         logger.debug(
             "Forwarding pending text to window %s (len=%d)",
             created_wname,
             len(pending_text),
         )
-        if context.user_data is not None:
-            context.user_data.pop(PENDING_THREAD_TEXT, None)
-            context.user_data.pop(PENDING_THREAD_ID, None)
-
         # Chat-first providers (shell): route through NL→command approval flow
         if provider_caps.chat_first_command_path:
             from .shell_commands import handle_shell_message
@@ -680,8 +672,6 @@ async def _create_window_and_bind(
                     f"❌ Failed to send pending message: {send_msg}",
                     message_thread_id=pending_thread_id,
                 )
-    elif context.user_data is not None:
-        context.user_data.pop(PENDING_THREAD_ID, None)
 
 
 async def _handle_mode_select(
@@ -741,8 +731,7 @@ async def _handle_cancel(
         return
     clear_browse_state(context.user_data)
     if context.user_data is not None:
-        context.user_data.pop(PENDING_THREAD_ID, None)
-        context.user_data.pop(PENDING_THREAD_TEXT, None)
+        clear_pending_thread(context.user_data)
         _clear_resume_flow_state(context.user_data)
     await query.answer("Cancelled")
     await safe_edit(query, "Cancelled")

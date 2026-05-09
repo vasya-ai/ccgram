@@ -42,9 +42,10 @@ from .message_sender import safe_edit, safe_send
 from .topic_emoji import format_topic_name_for_mode
 from .user_state import (
     PENDING_THREAD_ID,
-    PENDING_THREAD_TEXT,
     RECOVERY_SESSIONS,
     RECOVERY_WINDOW_ID,
+    clear_pending_thread,
+    flush_pending_prompt_text,
 )
 
 logger = structlog.get_logger()
@@ -324,12 +325,8 @@ def _clear_recovery_state(user_data: dict | None) -> None:
     """Remove all recovery-related keys from user_data."""
     if user_data is None:
         return
-    for key in (
-        PENDING_THREAD_ID,
-        PENDING_THREAD_TEXT,
-        RECOVERY_WINDOW_ID,
-        RECOVERY_SESSIONS,
-    ):
+    clear_pending_thread(user_data)
+    for key in (RECOVERY_WINDOW_ID, RECOVERY_SESSIONS):
         user_data.pop(key, None)
 
 
@@ -404,9 +401,7 @@ async def _create_and_bind_window(
     await safe_edit(query, f"\u2705 {message}\n\n{success_label}")
 
     # Forward pending text
-    pending_text = (
-        context.user_data.get(PENDING_THREAD_TEXT) if context.user_data else None
-    )
+    pending_text = flush_pending_prompt_text(context.user_data)
     _clear_recovery_state(context.user_data)
     if pending_text:
         send_ok, send_msg = await send_to_window(created_wid, pending_text)

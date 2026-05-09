@@ -33,7 +33,11 @@ from .directory_browser import (
 from .callback_registry import register
 from .message_sender import safe_edit, safe_send
 from .topic_emoji import format_topic_name_for_mode
-from .user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT
+from .user_state import (
+    PENDING_THREAD_ID,
+    clear_pending_thread,
+    flush_pending_prompt_text,
+)
 
 logger = structlog.get_logger()
 
@@ -226,12 +230,7 @@ async def _handle_bind(
         f"✅ Bound to window `{display}`",
     )
 
-    pending_text = (
-        context.user_data.get(PENDING_THREAD_TEXT) if context.user_data else None
-    )
-    if context.user_data is not None:
-        context.user_data.pop(PENDING_THREAD_TEXT, None)
-        context.user_data.pop(PENDING_THREAD_ID, None)
+    pending_text = flush_pending_prompt_text(context.user_data)
     if pending_text:
         await _forward_pending_text(
             context.bot,
@@ -283,8 +282,7 @@ async def _handle_cancel(
         return
     clear_window_picker_state(context.user_data)
     if context.user_data is not None:
-        context.user_data.pop(PENDING_THREAD_ID, None)
-        context.user_data.pop(PENDING_THREAD_TEXT, None)
+        clear_pending_thread(context.user_data)
     await query.answer("Cancelled")
     await safe_edit(query, "Cancelled")
 
